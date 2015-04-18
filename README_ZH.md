@@ -1,44 +1,50 @@
-Gogs - Go Git Service [![wercker status](https://app.wercker.com/status/ad0bdb0bc450ac6f09bc56b9640a50aa/s/ "wercker status")](https://app.wercker.com/project/bykey/ad0bdb0bc450ac6f09bc56b9640a50aa) [![Build Status](https://drone.io/github.com/gogits/gogs/status.png)](https://drone.io/github.com/gogits/gogs/latest)
+Gogs - Go Git Service [![Build Status](https://travis-ci.org/gogits/gogs.svg?branch=master)](https://travis-ci.org/gogits/gogs)
 =====================
 
-Gogs(Go Git Service) 是一个由 Go 语言编写的自助 Git 托管服务。
+Gogs (Go Git Service) 是一款可轻易搭建的自助 Git 服务。
 
-![Demo](http://gowalker.org/public/gogs_demo.gif)
+![Demo](http://gogs.qiniudn.com/gogs_demo.gif)
 
-##### 当前版本：0.4.5 Alpha
+##### 当前版本：0.6.1 Beta
 
 ## 开发目的
 
-Gogs 完全使用 Go 语言来实现对 Git 数据的操作，实现 **零** 依赖，并且支持 Go 语言所支持的 **所有平台**，包括 Linux、Mac OS X 以及 Windows。
-
-更重要的是，您只需要一个可执行文件就能借助 Gogs 快速搭建属于您自己的代码托管服务！
+Gogs 的目标是打造一个最简单、最快速和最轻松的方式搭建自助 Git 服务。使用 Go 语言开发使得 Gogs 能够通过独立的二进制分发，并且支持 Go 语言支持的 **所有平台**，包括 Linux、Mac OS X 以及 Windows。
 
 ## 项目概览
 
-- 有关项目设计、已知问题和变更日志，请通过  [使用手册](http://gogs.io/docs/intro/) 查看。
+- 有关项目设计、已知问题和变更日志，请通过 [使用手册](http://gogs.io/docs/intro/) 查看。
 - 您可以到 [Trello Board](https://trello.com/b/uxAoeLUl/gogs-go-git-service) 跟随开发团队的脚步。
-- 想要先睹为快？通过 [在线体验](http://try.gogits.org/Unknown/gogs) 或查看 **安装部署 -> 二进制安装** 小节。
+- 想要先睹为快？通过 [在线体验](https://try.gogs.io/unknwon/gogs) 或查看 **安装部署 -> 二进制安装** 小节。
 - 使用过程中遇到问题？尝试从 [故障排查](http://gogs.io/docs/intro/troubleshooting.md) 页面获取帮助。
+- 希望帮助多国语言界面的翻译吗？请立即访问 [详情页面](http://gogs.io/docs/features/i18n.html)！
 
 ## 功能特性
 
 - 活动时间线
 - 支持 SSH/HTTP(S) 协议
 - 支持 SMTP/LDAP/反向代理 用户认证
-- 注册/删除/重命名用户
-- 创建/迁移/镜像/删除/关注/重命名/转移 公开/私有 仓库
-- 仓库 浏览器/发布/缺陷管理/Web 钩子
-- 添加/删除 仓库协作者
-- Gravatar 以及缓存支持
-- 邮件服务（注册、Issue）
+- 支持反向代理子路径
+- 支持 注册/删除/重命名 用户
+- 支持 创建/管理/删除 组织以及团队管理功能
+- 支持 创建/派生/迁移/镜像/删除/关注/重命名/转移 公开/私有 仓库
+- 支持仓库 浏览/发布/工单管理
+- 支持仓库和组织级别 Web 钩子
+- 支持仓库 Git 钩子
+- 支持 添加/删除 仓库协作者
+- 支持 Gravatar 以及本地缓存
+- 支持邮件服务（注册、Issue）
 - 管理员面板
+- Slack Web 钩子集成
+- Drone CI 持续部署集成
 - 支持 MySQL、PostgreSQL 以及 SQLite3 数据库
 - 社交帐号登录（GitHub、Google、QQ、微博）
+- 多语言支持（[11 种语言]([more](https://crowdin.com/project/gogs))）
 
 ## 系统要求
 
 - 最低的系统硬件要求为一个廉价的树莓派
-- 如果用于团队项目，建议使用 4 核 CPU 及 1GB 内存
+- 如果用于团队项目，建议使用 2 核 CPU 及 1GB 内存
 
 ## 安装部署
 
@@ -46,25 +52,26 @@ Gogs 完全使用 Go 语言来实现对 Git 数据的操作，实现 **零** 依
 
 然后，您可以通过以下 5 种方式来安装 Gogs：
 
-- [二进制安装](http://gogs.io/docs/installation/install_from_binary.md): **强烈推荐**
+- [二进制安装](http://gogs.io/docs/installation/install_from_binary.md)
 - [源码安装](http://gogs.io/docs/installation/install_from_source.md)
 - [包管理安装](http://gogs.io/docs/installation/install_from_packages.md)
-- [采用 Docker 部署](https://github.com/gogits/gogs/tree/master/dockerfiles)
+- [采用 Docker 部署](https://github.com/gogits/gogs/tree/master/docker)
 - [通过 Vagrant 安装](https://github.com/geerlingguy/ansible-vagrant-examples/tree/master/gogs)
 
 ## 特别鸣谢
 
+- 基于 [Macaron](https://github.com/Unknwon/macaron) 的路由与中间件机制。
 - 基于 [WeTalk](https://github.com/beego/wetalk) 修改的邮件服务和模块设计。
 - 基于 [GoBlog](https://github.com/fuxiaohei/goblog) 修改的系统监视状态。
-- [beego](http://beego.me) 模块的使用与修改。
-- [martini](http://martini.codegangsta.io/) 的路由与中间件机制。
 - 感谢 [gobuild.io](http://gobuild.io) 提供二进制编译与下载服务。
 - 感谢 [lavachen](http://www.lavachen.cn/) 和 [Rocker](http://weibo.com/rocker1989) 设计的 Logo。
-- 感谢 [Docker 中文社区](http://www.dockboard.org/) 提供的 [dockerfiles](https://github.com/gogits/gogs/tree/master/dockerfiles)。
+- 感谢 [Crowdin](https://crowdin.com/project/gogs) 提供免费的开源项目本地化支持。
 
 ## 贡献成员
 
-本项目的 [开发团队](http://gogs.io/team)。您可以通过查看 [贡献者页面](https://github.com/gogits/gogs/graphs/contributors) 获取完整的贡献者列表。
+- 本项目的 [开发团队](http://gogs.io/team)。
+- 您可以通过查看 [贡献者页面](https://github.com/gogits/gogs/graphs/contributors) 获取完整的贡献者列表。
+- 您可以通过查看 [TRANSLATORS](conf/locale/TRANSLATORS) 文件获取完整的翻译人员列表。
 
 ## 授权许可
 

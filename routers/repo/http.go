@@ -6,6 +6,7 @@ package repo
 
 import (
 	"bytes"
+	"compress/gzip"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -15,20 +16,27 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/go-martini/martini"
 	"github.com/gogits/gogs/models"
+	"github.com/gogits/gogs/modules/base"
 	"github.com/gogits/gogs/modules/log"
 	"github.com/gogits/gogs/modules/middleware"
 	"github.com/gogits/gogs/modules/setting"
 )
 
-func Http(ctx *middleware.Context, params martini.Params) {
-	username := params["username"]
-	reponame := params["reponame"]
+func authRequired(ctx *middleware.Context) {
+	ctx.Resp.Header().Set("WWW-Authenticate", "Basic realm=\".\"")
+	ctx.Data["ErrorMsg"] = "no basic auth and digit auth"
+	ctx.HTML(401, base.TplName("status/401"))
+}
+
+func Http(ctx *middleware.Context) {
+	username := ctx.Params(":username")
+	reponame := ctx.Params(":reponame")
 	if strings.HasSuffix(reponame, ".git") {
 		reponame = reponame[:len(reponame)-4]
 	}
@@ -48,34 +56,36 @@ func Http(ctx *middleware.Context, params martini.Params) {
 	repoUser, err := models.GetUserByName(username)
 	if err != nil {
 		if err == models.ErrUserNotExist {
-			ctx.Handle(404, "repo.Http(GetUserByName)", nil)
+			ctx.Handle(404, "GetUserByName", nil)
 		} else {
-			ctx.Handle(500, "repo.Http(GetUserByName)", nil)
+			ctx.Handle(500, "GetUserByName", err)
 		}
 		return
 	}
 
 	repo, err := models.GetRepositoryByName(repoUser.Id, reponame)
 	if err != nil {
-		if err == models.ErrRepoNotExist {
-			ctx.Handle(404, "repo.Http(GetRepositoryByName)", nil)
+		if models.IsErrRepoNotExist(err) {
+			ctx.Handle(404, "GetRepositoryByName", nil)
 		} else {
-			ctx.Handle(500, "repo.Http(GetRepositoryByName)", nil)
+			ctx.Handle(500, "GetRepositoryByName", err)
 		}
 		return
 	}
 
-	// only public pull don't need auth
+	// Only public pull don't need auth.
 	isPublicPull := !repo.IsPrivate && isPull
-	var askAuth = !isPublicPull || setting.Service.RequireSignInView
-	var authUser *models.User
-	var authUsername, passwd string
+	var (
+		askAuth      = !isPublicPull || setting.Service.RequireSignInView
+		authUser     *models.User
+		authUsername string
+		authPasswd   string
+	)
 
 	// check access
 	if askAuth {
 		baHead := ctx.Req.Header.Get("Authorization")
 		if baHead == "" {
-			// ask auth
 			authRequired(ctx)
 			return
 		}
@@ -83,42 +93,56 @@ func Http(ctx *middleware.Context, params martini.Params) {
 		auths := strings.Fields(baHead)
 		// currently check basic auth
 		// TODO: support digit auth
+		// FIXME: middlewares/context.go did basic auth check already,
+		// maybe could use that one.
 		if len(auths) != 2 || auths[0] != "Basic" {
 			ctx.Handle(401, "no basic auth and digit auth", nil)
 			return
 		}
-		authUsername, passwd, err = basicDecode(auths[1])
+		authUsername, authPasswd, err = base.BasicAuthDecode(auths[1])
 		if err != nil {
 			ctx.Handle(401, "no basic auth and digit auth", nil)
 			return
 		}
 
-		authUser, err = models.GetUserByName(authUsername)
+		authUser, err = models.UserSignIn(authUsername, authPasswd)
 		if err != nil {
-			ctx.Handle(401, "no basic auth and digit auth", nil)
-			return
-		}
+			if err != models.ErrUserNotExist {
+				ctx.Handle(500, "UserSignIn error: %v", err)
+				return
+			}
 
-		newUser := &models.User{Passwd: passwd, Salt: authUser.Salt}
-		newUser.EncodePasswd()
-		if authUser.Passwd != newUser.Passwd {
-			ctx.Handle(401, "no basic auth and digit auth", nil)
-			return
+			// Assume username now is a token.
+			token, err := models.GetAccessTokenBySha(authUsername)
+			if err != nil {
+				if err == models.ErrAccessTokenNotExist {
+					ctx.Handle(401, "invalid token", nil)
+				} else {
+					ctx.Handle(500, "GetAccessTokenBySha", err)
+				}
+				return
+			}
+			authUser, err = models.GetUserById(token.Uid)
+			if err != nil {
+				ctx.Handle(500, "GetUserById", err)
+				return
+			}
+			authUsername = authUser.Name
 		}
 
 		if !isPublicPull {
-			var tp = models.WRITABLE
+			var tp = models.ACCESS_MODE_WRITE
 			if isPull {
-				tp = models.READABLE
+				tp = models.ACCESS_MODE_READ
 			}
 
-			has, err := models.HasAccess(authUsername, username+"/"+reponame, tp)
+			has, err := models.HasAccess(authUser, repo, tp)
 			if err != nil {
 				ctx.Handle(401, "no basic auth and digit auth", nil)
 				return
 			} else if !has {
-				if tp == models.READABLE {
-					has, err = models.HasAccess(authUsername, username+"/"+reponame, models.WRITABLE)
+				if tp == models.ACCESS_MODE_READ {
+					has, err = models.HasAccess(authUser, repo, models.ACCESS_MODE_WRITE)
 					if err != nil || !has {
 						ctx.Handle(401, "no basic auth and digit auth", nil)
 						return
@@ -128,12 +152,15 @@ func Http(ctx *middleware.Context, params martini.Params) {
 					return
 				}
 			}
+
+			if !isPull && repo.IsMirror {
+				ctx.Handle(401, "can't push to mirror", nil)
+				return
+			}
 		}
 	}
 
-	var f func(rpc string, input []byte)
-
-	f = func(rpc string, input []byte) {
+	callback := func(rpc string, input []byte) {
 		if rpc == "receive-pack" {
 			var lastLine int64 = 0
 
@@ -142,7 +169,7 @@ func Http(ctx *middleware.Context, params martini.Params) {
 				if head[0] == '0' && head[1] == '0' {
 					size, err := strconv.ParseInt(string(input[lastLine+2:lastLine+4]), 16, 32)
 					if err != nil {
-						log.Error("%v", err)
+						log.Error(4, "%v", err)
 						return
 					}
 
@@ -162,35 +189,34 @@ func Http(ctx *middleware.Context, params martini.Params) {
 						newCommitId := fields[1]
 						refName := fields[2]
 
+						// FIXME: handle error.
 						models.Update(refName, oldCommitId, newCommitId, authUsername, username, reponame, authUser.Id)
 					}
 					lastLine = lastLine + size
 				} else {
-					//fmt.Println("ddddddddddd")
 					break
 				}
 			}
 		}
 	}
 
-	config := Config{setting.RepoRootPath, "git", true, true, f}
+	HTTPBackend(&Config{
+		RepoRootPath: setting.RepoRootPath,
+		GitBinPath:   "git",
+		UploadPack:   true,
+		ReceivePack:  true,
+		OnSucceed:    callback,
+	})(ctx.Resp, ctx.Req.Request)
 
-	handler := HttpBackend(&config)
-	handler(ctx.ResponseWriter, ctx.Req)
-}
-
-type route struct {
-	cr      *regexp.Regexp
-	method  string
-	handler func(handler)
+	runtime.GC()
 }
 
 type Config struct {
-	ReposRoot   string
-	GitBinPath  string
-	UploadPack  bool
-	ReceivePack bool
-	OnSucceed   func(rpc string, input []byte)
+	RepoRootPath string
+	GitBinPath   string
+	UploadPack   bool
+	ReceivePack  bool
+	OnSucceed    func(rpc string, input []byte)
 }
 
 type handler struct {
@@ -199,6 +225,12 @@ type handler struct {
 	r    *http.Request
 	Dir  string
 	File string
+}
+
+type route struct {
+	cr      *regexp.Regexp
+	method  string
+	handler func(handler)
 }
 
 var routes = []route{
@@ -216,9 +248,10 @@ var routes = []route{
 }
 
 // Request handling function
-func HttpBackend(config *Config) http.HandlerFunc {
+func HTTPBackend(config *Config) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		for _, route := range routes {
+			r.URL.Path = strings.ToLower(r.URL.Path) // blue: In case some repo name has upper case name
 			if m := route.cr.FindStringSubmatch(r.URL.Path); m != nil {
 				if route.method != r.Method {
 					renderMethodNotAllowed(w, r)
@@ -229,7 +262,7 @@ func HttpBackend(config *Config) http.HandlerFunc {
 				dir, err := getGitDir(config, m[1])
 
 				if err != nil {
-					log.GitLogger.Error(err.Error())
+					log.GitLogger.Error(4, err.Error())
 					renderNotFound(w)
 					return
 				}
@@ -256,23 +289,41 @@ func serviceReceivePack(hr handler) {
 
 func serviceRpc(rpc string, hr handler) {
 	w, r, dir := hr.w, hr.r, hr.Dir
-	access := hasAccess(r, hr.Config, dir, rpc, true)
 
-	if access == false {
+	if !hasAccess(r, hr.Config, dir, rpc, true) {
 		renderNoAccess(w)
 		return
 	}
 
 	w.Header().Set("Content-Type", fmt.Sprintf("application/x-git-%s-result", rpc))
-	w.WriteHeader(http.StatusOK)
 
-	var input []byte
-	var br io.Reader
+	var (
+		reqBody = r.Body
+		input   []byte
+		br      io.Reader
+		err     error
+	)
+
+	// Handle GZIP.
+	if r.Header.Get("Content-Encoding") == "gzip" {
+		reqBody, err = gzip.NewReader(reqBody)
+		if err != nil {
+			log.GitLogger.Error(2, "fail to create gzip reader: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+	}
+
 	if hr.Config.OnSucceed != nil {
-		input, _ = ioutil.ReadAll(r.Body)
+		input, err = ioutil.ReadAll(reqBody)
+		if err != nil {
+			log.GitLogger.Error(2, "fail to read request body: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
 		br = bytes.NewReader(input)
 	} else {
-		br = r.Body
+		br = reqBody
 	}
 
 	args := []string{rpc, "--stateless-rpc", dir}
@@ -281,9 +332,9 @@ func serviceRpc(rpc string, hr handler) {
 	cmd.Stdout = w
 	cmd.Stdin = br
 
-	err := cmd.Run()
-	if err != nil {
-		log.GitLogger.Error(err.Error())
+	if err := cmd.Run(); err != nil {
+		log.GitLogger.Error(2, "fail to serve RPC(%s): %v", rpc, err)
+		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 
@@ -345,7 +396,7 @@ func sendFile(contentType string, hr handler) {
 	w, r := hr.w, hr.r
 	reqFile := path.Join(hr.Dir, hr.File)
 
-	//fmt.Println("sendFile:", reqFile)
+	// fmt.Println("sendFile:", reqFile)
 
 	f, err := os.Stat(reqFile)
 	if os.IsNotExist(err) {
@@ -360,13 +411,13 @@ func sendFile(contentType string, hr handler) {
 }
 
 func getGitDir(config *Config, fPath string) (string, error) {
-	root := config.ReposRoot
+	root := config.RepoRootPath
 
 	if root == "" {
 		cwd, err := os.Getwd()
 
 		if err != nil {
-			log.GitLogger.Error(err.Error())
+			log.GitLogger.Error(4, err.Error())
 			return "", err
 		}
 
@@ -443,7 +494,7 @@ func gitCommand(gitBinPath, dir string, args ...string) []byte {
 	out, err := command.Output()
 
 	if err != nil {
-		log.GitLogger.Error(err.Error())
+		log.GitLogger.Error(4, err.Error())
 	}
 
 	return out

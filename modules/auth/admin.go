@@ -5,36 +5,23 @@
 package auth
 
 import (
-	"net/http"
-	"reflect"
+	"github.com/Unknwon/macaron"
 
-	"github.com/go-martini/martini"
-
-	"github.com/gogits/gogs/modules/base"
-	"github.com/gogits/gogs/modules/middleware/binding"
+	"github.com/macaron-contrib/binding"
 )
 
 type AdminEditUserForm struct {
-	Email     string `form:"email" binding:"Required;Email;MaxSize(50)"`
-	Website   string `form:"website" binding:"MaxSize(50)"`
-	Location  string `form:"location" binding:"MaxSize(50)"`
-	Avatar    string `form:"avatar" binding:"Required;Email;MaxSize(50)"`
-	Active    bool   `form:"active"`
-	Admin     bool   `form:"admin"`
-	LoginType int    `form:"login_type"`
+	Email        string `binding:"Required;Email;MaxSize(50)"`
+	Password     string `binding:"OmitEmpty;MinSize(6);MaxSize(255)"`
+	Website      string `binding:"MaxSize(50)"`
+	Location     string `binding:"MaxSize(50)"`
+	Avatar       string `binding:"Required;Email;MaxSize(50)"`
+	Active       bool
+	Admin        bool
+	AllowGitHook bool
+	LoginType    int
 }
 
-func (f *AdminEditUserForm) Name(field string) string {
-	names := map[string]string{
-		"Email":    "E-mail address",
-		"Website":  "Website",
-		"Location": "Location",
-		"Avatar":   "Gravatar Email",
-	}
-	return names[field]
-}
-
-func (f *AdminEditUserForm) Validate(errors *binding.Errors, req *http.Request, context martini.Context) {
-	data := context.Get(reflect.TypeOf(base.TmplData{})).Interface().(base.TmplData)
-	validate(errors, data, f)
+func (f *AdminEditUserForm) Validate(ctx *macaron.Context, errs binding.Errors) binding.Errors {
+	return validate(errs, ctx.Data, f, ctx.Locale)
 }

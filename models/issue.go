@@ -7,18 +7,26 @@ package models
 import (
 	"bytes"
 	"errors"
+	"html/template"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/Unknwon/com"
 	"github.com/go-xorm/xorm"
 
-	"github.com/gogits/gogs/modules/base"
+	"github.com/gogits/gogs/modules/log"
 )
 
 var (
-	ErrIssueNotExist     = errors.New("Issue does not exist")
-	ErrLabelNotExist     = errors.New("Label does not exist")
-	ErrMilestoneNotExist = errors.New("Milestone does not exist")
+	ErrIssueNotExist       = errors.New("Issue does not exist")
+	ErrLabelNotExist       = errors.New("Label does not exist")
+	ErrMilestoneNotExist   = errors.New("Milestone does not exist")
+	ErrWrongIssueCounter   = errors.New("Invalid number of issues for this milestone")
+	ErrAttachmentNotExist  = errors.New("Attachment does not exist")
+	ErrAttachmentNotLinked = errors.New("Attachment does not belong to this issue")
+	ErrMissingIssueNumber  = errors.New("No issue number specified")
 )
 
 // Issue represents an issue or pull request of repository.
@@ -64,7 +72,7 @@ func (i *Issue) GetLabels() error {
 	strIds := strings.Split(strings.TrimSuffix(i.LabelIds[1:], "|"), "|$")
 	i.Labels = make([]*Label, 0, len(strIds))
 	for _, strId := range strIds {
-		id, _ := base.StrTo(strId).Int64()
+		id, _ := com.StrTo(strId).Int64()
 		if id > 0 {
 			l, err := GetLabelById(id)
 			if err != nil {
@@ -90,6 +98,19 @@ func (i *Issue) GetAssignee() (err error) {
 	return err
 }
 
+func (i *Issue) Attachments() []*Attachment {
+	a, _ := GetAttachmentsForIssue(i.Id)
+	return a
+}
+
+func (i *Issue) AfterDelete() {
+	_, err := DeleteAttachmentsByIssue(i.Id, true)
+
+	if err != nil {
+		log.Info("Could not delete files for issue #%d: %s", i.Id, err)
+	}
+}
+
 // CreateIssue creates new issue for repository.
 func NewIssue(issue *Issue) (err error) {
 	sess := x.NewSession()
@@ -108,7 +129,40 @@ func NewIssue(issue *Issue) (err error) {
 		sess.Rollback()
 		return err
 	}
-	return sess.Commit()
+
+	if err = sess.Commit(); err != nil {
+		return err
+	}
+
+	if issue.MilestoneId > 0 {
+		// FIXES(280): Update milestone counter.
+		return ChangeMilestoneAssign(0, issue.MilestoneId, issue)
+	}
+
+	return
+}
+
+// GetIssueByRef returns an Issue specified by a GFM reference.
+// See https://help.github.com/articles/writing-on-github#references for more information on the syntax.
+func GetIssueByRef(ref string) (issue *Issue, err error) {
+	var issueNumber int64
+	var repo *Repository
+
+	n := strings.IndexByte(ref, byte('#'))
+
+	if n == -1 {
+		return nil, ErrMissingIssueNumber
+	}
+
+	if issueNumber, err = strconv.ParseInt(ref[n+1:], 10, 64); err != nil {
+		return
+	}
+
+	if repo, err = GetRepositoryByRef(ref[:n]); err != nil {
+		return
+	}
+
+	return GetIssueByIndex(repo.Id, issueNumber)
 }
 
 // GetIssueByIndex returns issue by given index in repository.
@@ -157,7 +211,10 @@ func GetIssues(uid, rid, pid, mid int64, page int, isClosed bool, labelIds, sort
 
 	if len(labelIds) > 0 {
 		for _, label := range strings.Split(labelIds, ",") {
-			sess.And("label_ids like '%$" + label + "|%'")
+			// Prevent SQL inject.
+			if com.StrTo(label).MustInt() > 0 {
+				sess.And("label_ids like '%$" + label + "|%'")
+			}
 		}
 	}
 
@@ -225,30 +282,33 @@ type IssueUser struct {
 }
 
 // NewIssueUserPairs adds new issue-user pairs for new issue of repository.
-func NewIssueUserPairs(rid, iid, oid, pid, aid int64, repoName string) (err error) {
-	iu := &IssueUser{IssueId: iid, RepoId: rid}
-
-	us, err := GetCollaborators(repoName)
+func NewIssueUserPairs(repo *Repository, issueID, orgID, posterID, assigneeID int64) (err error) {
+	users, err := repo.GetCollaborators()
 	if err != nil {
 		return err
 	}
 
+	iu := &IssueUser{
+		IssueId: issueID,
+		RepoId:  repo.Id,
+	}
+
 	isNeedAddPoster := true
-	for _, u := range us {
+	for _, u := range users {
 		iu.Uid = u.Id
-		iu.IsPoster = iu.Uid == pid
+		iu.IsPoster = iu.Uid == posterID
 		if isNeedAddPoster && iu.IsPoster {
 			isNeedAddPoster = false
 		}
-		iu.IsAssigned = iu.Uid == aid
+		iu.IsAssigned = iu.Uid == assigneeID
 		if _, err = x.Insert(iu); err != nil {
 			return err
 		}
 	}
 	if isNeedAddPoster {
-		iu.Uid = pid
+		iu.Uid = posterID
 		iu.IsPoster = true
-		iu.IsAssigned = iu.Uid == aid
+		iu.IsAssigned = iu.Uid == assigneeID
 		if _, err = x.Insert(iu); err != nil {
 			return err
 		}
@@ -276,14 +336,17 @@ func GetIssueUserPairs(rid, uid int64, isClosed bool) ([]*IssueUser, error) {
 
 // GetIssueUserPairsByRepoIds returns issue-user pairs by given repository IDs.
 func GetIssueUserPairsByRepoIds(rids []int64, isClosed bool, page int) ([]*IssueUser, error) {
+	if len(rids) == 0 {
+		return []*IssueUser{}, nil
+	}
+
 	buf := bytes.NewBufferString("")
 	for _, rid := range rids {
 		buf.WriteString("repo_id=")
-		buf.WriteString(base.ToStr(rid))
+		buf.WriteString(com.ToStr(rid))
 		buf.WriteString(" OR ")
 	}
 	cond := strings.TrimSuffix(buf.String(), " OR ")
-
 	ius := make([]*IssueUser, 0, 10)
 	sess := x.Limit(20, (page-1)*20).Where("is_closed=?", isClosed)
 	if len(cond) > 0 {
@@ -386,6 +449,11 @@ func GetUserIssueStats(uid int64, filterMode int) *IssueStats {
 // UpdateIssue updates information of issue.
 func UpdateIssue(issue *Issue) error {
 	_, err := x.Id(issue.Id).AllCols().Update(issue)
+
+	if err != nil {
+		return err
+	}
+
 	return err
 }
 
@@ -407,8 +475,8 @@ func UpdateIssueUserPairByAssignee(aid, iid int64) error {
 	if aid == 0 {
 		return nil
 	}
-	rawSql = "UPDATE `issue_user` SET is_assigned = true WHERE uid = ? AND issue_id = ?"
-	_, err := x.Exec(rawSql, aid, iid)
+	rawSql = "UPDATE `issue_user` SET is_assigned = ? WHERE uid = ? AND issue_id = ?"
+	_, err := x.Exec(rawSql, true, aid, iid)
 	return err
 }
 
@@ -496,13 +564,13 @@ func GetLabels(repoId int64) ([]*Label, error) {
 
 // UpdateLabel updates label information.
 func UpdateLabel(l *Label) error {
-	_, err := x.Id(l.Id).Update(l)
+	_, err := x.Id(l.Id).AllCols().Update(l)
 	return err
 }
 
 // DeleteLabel delete a label of given repository.
 func DeleteLabel(repoId int64, strId string) error {
-	id, _ := base.StrTo(strId).Int64()
+	id, _ := com.StrTo(strId).Int64()
 	l, err := GetLabelById(id)
 	if err != nil {
 		if err == ErrLabelNotExist {
@@ -550,7 +618,7 @@ type Milestone struct {
 	RepoId          int64 `xorm:"INDEX"`
 	Index           int64
 	Name            string
-	Content         string
+	Content         string `xorm:"TEXT"`
 	RenderedContent string `xorm:"-"`
 	IsClosed        bool
 	NumIssues       int
@@ -656,6 +724,32 @@ func ChangeMilestoneStatus(m *Milestone, isClosed bool) (err error) {
 	return sess.Commit()
 }
 
+// ChangeMilestoneIssueStats updates the open/closed issues counter and progress for the
+// milestone associated witht the given issue.
+func ChangeMilestoneIssueStats(issue *Issue) error {
+	if issue.MilestoneId == 0 {
+		return nil
+	}
+
+	m, err := GetMilestoneById(issue.MilestoneId)
+
+	if err != nil {
+		return err
+	}
+
+	if issue.IsClosed {
+		m.NumOpenIssues--
+		m.NumClosedIssues++
+	} else {
+		m.NumOpenIssues++
+		m.NumClosedIssues--
+	}
+
+	m.Completeness = m.NumClosedIssues * 100 / m.NumIssues
+
+	return UpdateMilestone(m)
+}
+
 // ChangeMilestoneAssign changes assignment of milestone for issue.
 func ChangeMilestoneAssign(oldMid, mid int64, issue *Issue) (err error) {
 	sess := x.NewSession()
@@ -679,7 +773,8 @@ func ChangeMilestoneAssign(oldMid, mid int64, issue *Issue) (err error) {
 		} else {
 			m.Completeness = 0
 		}
-		if _, err = sess.Id(m.Id).Update(m); err != nil {
+
+		if _, err = sess.Id(m.Id).Cols("num_issues,num_completeness,num_closed_issues").Update(m); err != nil {
 			sess.Rollback()
 			return err
 		}
@@ -696,12 +791,18 @@ func ChangeMilestoneAssign(oldMid, mid int64, issue *Issue) (err error) {
 		if err != nil {
 			return err
 		}
+
 		m.NumIssues++
 		if issue.IsClosed {
 			m.NumClosedIssues++
 		}
+
+		if m.NumIssues == 0 {
+			return ErrWrongIssueCounter
+		}
+
 		m.Completeness = m.NumClosedIssues * 100 / m.NumIssues
-		if _, err = sess.Id(m.Id).Update(m); err != nil {
+		if _, err = sess.Id(m.Id).Cols("num_issues,num_completeness,num_closed_issues").Update(m); err != nil {
 			sess.Rollback()
 			return err
 		}
@@ -712,6 +813,7 @@ func ChangeMilestoneAssign(oldMid, mid int64, issue *Issue) (err error) {
 			return err
 		}
 	}
+
 	return sess.Commit()
 }
 
@@ -755,17 +857,27 @@ func DeleteMilestone(m *Milestone) (err error) {
 //  \______  /\____/|__|_|  /__|_|  /\___  >___|  /__|
 //         \/             \/      \/     \/     \/
 
-// Issue types.
+// CommentType defines whether a comment is just a simple comment, an action (like close) or a reference.
+type CommentType int
+
 const (
-	IT_PLAIN  = iota // Pure comment.
-	IT_REOPEN        // Issue reopen status change prompt.
-	IT_CLOSE         // Issue close status change prompt.
+	// Plain comment, can be associated with a commit (CommitId > 0) and a line (Line > 0)
+	COMMENT_TYPE_COMMENT CommentType = iota
+	COMMENT_TYPE_REOPEN
+	COMMENT_TYPE_CLOSE
+
+	// References.
+	COMMENT_TYPE_ISSUE
+	// Reference from some commit (not part of a pull request)
+	COMMENT_TYPE_COMMIT
+	// Reference from some pull request
+	COMMENT_TYPE_PULL
 )
 
 // Comment represents a comment in commit and issue page.
 type Comment struct {
 	Id       int64
-	Type     int
+	Type     CommentType
 	PosterId int64
 	Poster   *User `xorm:"-"`
 	IssueId  int64
@@ -776,41 +888,71 @@ type Comment struct {
 }
 
 // CreateComment creates comment of issue or commit.
-func CreateComment(userId, repoId, issueId, commitId, line int64, cmtType int, content string) error {
+func CreateComment(userId, repoId, issueId, commitId, line int64, cmtType CommentType, content string, attachments []int64) (*Comment, error) {
 	sess := x.NewSession()
 	defer sess.Close()
 	if err := sess.Begin(); err != nil {
-		return err
+		return nil, err
 	}
 
-	if _, err := sess.Insert(&Comment{PosterId: userId, Type: cmtType, IssueId: issueId,
-		CommitId: commitId, Line: line, Content: content}); err != nil {
+	comment := &Comment{PosterId: userId, Type: cmtType, IssueId: issueId,
+		CommitId: commitId, Line: line, Content: content}
+
+	if _, err := sess.Insert(comment); err != nil {
 		sess.Rollback()
-		return err
+		return nil, err
 	}
 
 	// Check comment type.
 	switch cmtType {
-	case IT_PLAIN:
+	case COMMENT_TYPE_COMMENT:
 		rawSql := "UPDATE `issue` SET num_comments = num_comments + 1 WHERE id = ?"
 		if _, err := sess.Exec(rawSql, issueId); err != nil {
 			sess.Rollback()
-			return err
+			return nil, err
 		}
-	case IT_REOPEN:
+
+		if len(attachments) > 0 {
+			rawSql = "UPDATE `attachment` SET comment_id = ? WHERE id IN (?)"
+
+			astrs := make([]string, 0, len(attachments))
+
+			for _, a := range attachments {
+				astrs = append(astrs, strconv.FormatInt(a, 10))
+			}
+
+			if _, err := sess.Exec(rawSql, comment.Id, strings.Join(astrs, ",")); err != nil {
+				sess.Rollback()
+				return nil, err
+			}
+		}
+	case COMMENT_TYPE_REOPEN:
 		rawSql := "UPDATE `repository` SET num_closed_issues = num_closed_issues - 1 WHERE id = ?"
 		if _, err := sess.Exec(rawSql, repoId); err != nil {
 			sess.Rollback()
-			return err
+			return nil, err
 		}
-	case IT_CLOSE:
+	case COMMENT_TYPE_CLOSE:
 		rawSql := "UPDATE `repository` SET num_closed_issues = num_closed_issues + 1 WHERE id = ?"
 		if _, err := sess.Exec(rawSql, repoId); err != nil {
 			sess.Rollback()
-			return err
+			return nil, err
 		}
 	}
-	return sess.Commit()
+
+	return comment, sess.Commit()
+}
+
+// GetCommentById returns the comment with the given id
+func GetCommentById(commentId int64) (*Comment, error) {
+	c := &Comment{Id: commentId}
+	_, err := x.Get(c)
+
+	return c, err
+}
+
+func (c *Comment) ContentHtml() template.HTML {
+	return template.HTML(c.Content)
 }
 
 // GetIssueComments returns list of comment by given issue id.
@@ -818,4 +960,128 @@ func GetIssueComments(issueId int64) ([]Comment, error) {
 	comments := make([]Comment, 0, 10)
 	err := x.Asc("created").Find(&comments, &Comment{IssueId: issueId})
 	return comments, err
+}
+
+// Attachments returns the attachments for this comment.
+func (c *Comment) Attachments() []*Attachment {
+	a, _ := GetAttachmentsByComment(c.Id)
+	return a
+}
+
+func (c *Comment) AfterDelete() {
+	_, err := DeleteAttachmentsByComment(c.Id, true)
+
+	if err != nil {
+		log.Info("Could not delete files for comment %d on issue #%d: %s", c.Id, c.IssueId, err)
+	}
+}
+
+type Attachment struct {
+	Id        int64
+	IssueId   int64
+	CommentId int64
+	Name      string
+	Path      string    `xorm:"TEXT"`
+	Created   time.Time `xorm:"CREATED"`
+}
+
+// CreateAttachment creates a new attachment inside the database and
+func CreateAttachment(issueId, commentId int64, name, path string) (*Attachment, error) {
+	sess := x.NewSession()
+	defer sess.Close()
+
+	if err := sess.Begin(); err != nil {
+		return nil, err
+	}
+
+	a := &Attachment{IssueId: issueId, CommentId: commentId, Name: name, Path: path}
+
+	if _, err := sess.Insert(a); err != nil {
+		sess.Rollback()
+		return nil, err
+	}
+
+	return a, sess.Commit()
+}
+
+// Attachment returns the attachment by given ID.
+func GetAttachmentById(id int64) (*Attachment, error) {
+	m := &Attachment{Id: id}
+
+	has, err := x.Get(m)
+
+	if err != nil {
+		return nil, err
+	}
+
+	if !has {
+		return nil, ErrAttachmentNotExist
+	}
+
+	return m, nil
+}
+
+func GetAttachmentsForIssue(issueId int64) ([]*Attachment, error) {
+	attachments := make([]*Attachment, 0, 10)
+	err := x.Where("issue_id = ?", issueId).And("comment_id = 0").Find(&attachments)
+	return attachments, err
+}
+
+// GetAttachmentsByIssue returns a list of attachments for the given issue
+func GetAttachmentsByIssue(issueId int64) ([]*Attachment, error) {
+	attachments := make([]*Attachment, 0, 10)
+	err := x.Where("issue_id = ?", issueId).And("comment_id > 0").Find(&attachments)
+	return attachments, err
+}
+
+// GetAttachmentsByComment returns a list of attachments for the given comment
+func GetAttachmentsByComment(commentId int64) ([]*Attachment, error) {
+	attachments := make([]*Attachment, 0, 10)
+	err := x.Where("comment_id = ?", commentId).Find(&attachments)
+	return attachments, err
+}
+
+// DeleteAttachment deletes the given attachment and optionally the associated file.
+func DeleteAttachment(a *Attachment, remove bool) error {
+	_, err := DeleteAttachments([]*Attachment{a}, remove)
+	return err
+}
+
+// DeleteAttachments deletes the given attachments and optionally the associated files.
+func DeleteAttachments(attachments []*Attachment, remove bool) (int, error) {
+	for i, a := range attachments {
+		if remove {
+			if err := os.Remove(a.Path); err != nil {
+				return i, err
+			}
+		}
+
+		if _, err := x.Delete(a.Id); err != nil {
+			return i, err
+		}
+	}
+
+	return len(attachments), nil
+}
+
+// DeleteAttachmentsByIssue deletes all attachments associated with the given issue.
+func DeleteAttachmentsByIssue(issueId int64, remove bool) (int, error) {
+	attachments, err := GetAttachmentsByIssue(issueId)
+
+	if err != nil {
+		return 0, err
+	}
+
+	return DeleteAttachments(attachments, remove)
+}
+
+// DeleteAttachmentsByComment deletes all attachments associated with the given comment.
+func DeleteAttachmentsByComment(commentId int64, remove bool) (int, error) {
+	attachments, err := GetAttachmentsByComment(commentId)
+
+	if err != nil {
+		return 0, err
+	}
+
+	return DeleteAttachments(attachments, remove)
 }

@@ -5,7 +5,6 @@
 package v1
 
 import (
-	"io/ioutil"
 	"strings"
 
 	"github.com/gogits/gogs/modules/auth/apiv1"
@@ -14,12 +13,15 @@ import (
 	"github.com/gogits/gogs/modules/setting"
 )
 
-const DOC_URL = "http://gogs.io/docs"
-
 // Render an arbitrary Markdown document.
 func Markdown(ctx *middleware.Context, form apiv1.MarkdownForm) {
 	if ctx.HasApiError() {
-		ctx.JSON(422, base.ApiJsonErr{ctx.GetErrMsg(), DOC_URL})
+		ctx.JSON(422, base.ApiJsonErr{ctx.GetErrMsg(), base.DOC_URL})
+		return
+	}
+
+	if len(form.Text) == 0 {
+		ctx.Write([]byte(""))
 		return
 	}
 
@@ -34,9 +36,9 @@ func Markdown(ctx *middleware.Context, form apiv1.MarkdownForm) {
 
 // Render a Markdown document in raw mode.
 func MarkdownRaw(ctx *middleware.Context) {
-	body, err := ioutil.ReadAll(ctx.Req.Body)
+	body, err := ctx.Req.Body().Bytes()
 	if err != nil {
-		ctx.JSON(422, base.ApiJsonErr{err.Error(), DOC_URL})
+		ctx.JSON(422, base.ApiJsonErr{err.Error(), base.DOC_URL})
 		return
 	}
 	ctx.Write(base.RenderRawMarkdown(body, ""))

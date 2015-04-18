@@ -6,31 +6,17 @@ package repo
 
 import (
 	"io"
-	"os"
-	"path/filepath"
-
-	"github.com/Unknwon/com"
-	"github.com/go-martini/martini"
-
-	"github.com/gogits/git"
+	"path"
 
 	"github.com/gogits/gogs/modules/base"
+	"github.com/gogits/gogs/modules/git"
 	"github.com/gogits/gogs/modules/middleware"
 )
 
-func SingleDownload(ctx *middleware.Context, params martini.Params) {
-	treename := params["_1"]
-
-	blob, err := ctx.Repo.Commit.GetBlobByPath(treename)
-	if err != nil {
-		ctx.Handle(500, "repo.SingleDownload(GetBlobByPath)", err)
-		return
-	}
-
+func ServeBlob(ctx *middleware.Context, blob *git.Blob) error {
 	dataRc, err := blob.Data()
 	if err != nil {
-		ctx.Handle(500, "repo.SingleDownload(Data)", err)
-		return
+		return err
 	}
 
 	buf := make([]byte, 1024)
@@ -39,67 +25,29 @@ func SingleDownload(ctx *middleware.Context, params martini.Params) {
 		buf = buf[:n]
 	}
 
-	defer func() {
-		dataRc.Close()
-	}()
-
-	contentType, isTextFile := base.IsTextFile(buf)
+	_, isTextFile := base.IsTextFile(buf)
 	_, isImageFile := base.IsImageFile(buf)
-	ctx.Res.Header().Set("Content-Type", contentType)
+	ctx.Resp.Header().Set("Content-Type", "text/plain")
 	if !isTextFile && !isImageFile {
-		ctx.Res.Header().Set("Content-Disposition", "attachment; filename="+filepath.Base(treename))
-		ctx.Res.Header().Set("Content-Transfer-Encoding", "binary")
+		ctx.Resp.Header().Set("Content-Disposition", "attachment; filename="+path.Base(ctx.Repo.TreeName))
+		ctx.Resp.Header().Set("Content-Transfer-Encoding", "binary")
 	}
-	ctx.Res.Write(buf)
-	io.Copy(ctx.Res, dataRc)
+	ctx.Resp.Write(buf)
+	_, err = io.Copy(ctx.Resp, dataRc)
+	return err
 }
 
-func ZipDownload(ctx *middleware.Context, params martini.Params) {
-	commitId := ctx.Repo.CommitId
-	archivesPath := filepath.Join(ctx.Repo.GitRepo.Path, "archives/zip")
-	if !com.IsDir(archivesPath) {
-		if err := os.MkdirAll(archivesPath, 0755); err != nil {
-			ctx.Handle(500, "ZipDownload -> os.Mkdir(archivesPath)", err)
-			return
+func SingleDownload(ctx *middleware.Context) {
+	blob, err := ctx.Repo.Commit.GetBlobByPath(ctx.Repo.TreeName)
+	if err != nil {
+		if err == git.ErrNotExist {
+			ctx.Handle(404, "GetBlobByPath", nil)
+		} else {
+			ctx.Handle(500, "GetBlobByPath", err)
 		}
-	}
-
-	archivePath := filepath.Join(archivesPath, commitId+".zip")
-
-	if com.IsFile(archivePath) {
-		ctx.ServeFile(archivePath, ctx.Repo.Repository.Name+".zip")
 		return
 	}
-
-	if err := ctx.Repo.Commit.CreateArchive(archivePath, git.AT_ZIP); err != nil {
-		ctx.Handle(500, "ZipDownload -> CreateArchive "+archivePath, err)
-		return
+	if err = ServeBlob(ctx, blob); err != nil {
+		ctx.Handle(500, "ServeBlob", err)
 	}
-
-	ctx.ServeFile(archivePath, ctx.Repo.Repository.Name+".zip")
-}
-
-func TarGzDownload(ctx *middleware.Context, params martini.Params) {
-	commitId := ctx.Repo.CommitId
-	archivesPath := filepath.Join(ctx.Repo.GitRepo.Path, "archives/targz")
-	if !com.IsDir(archivesPath) {
-		if err := os.MkdirAll(archivesPath, 0755); err != nil {
-			ctx.Handle(500, "TarGzDownload -> os.Mkdir(archivesPath)", err)
-			return
-		}
-	}
-
-	archivePath := filepath.Join(archivesPath, commitId+".tar.gz")
-
-	if com.IsFile(archivePath) {
-		ctx.ServeFile(archivePath, ctx.Repo.Repository.Name+".tar.gz")
-		return
-	}
-
-	if err := ctx.Repo.Commit.CreateArchive(archivePath, git.AT_TARGZ); err != nil {
-		ctx.Handle(500, "TarGzDownload -> CreateArchive "+archivePath, err)
-		return
-	}
-
-	ctx.ServeFile(archivePath, ctx.Repo.Repository.Name+".tar.gz")
 }

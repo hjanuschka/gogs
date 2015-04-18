@@ -8,8 +8,10 @@ import (
 	"os"
 
 	"github.com/codegangsta/cli"
+
 	"github.com/gogits/gogs/models"
 	"github.com/gogits/gogs/modules/log"
+	"github.com/gogits/gogs/modules/setting"
 )
 
 var CmdUpdate = cli.Command{
@@ -17,10 +19,15 @@ var CmdUpdate = cli.Command{
 	Usage:       "This command should only be called by SSH shell",
 	Description: `Update get pushed info and insert into database`,
 	Action:      runUpdate,
-	Flags:       []cli.Flag{},
+	Flags: []cli.Flag{
+		cli.StringFlag{"config, c", "custom/conf/app.ini", "Custom configuration file path", ""},
+	},
 }
 
 func runUpdate(c *cli.Context) {
+	if c.IsSet("config") {
+		setting.CustomConf = c.String("config")
+	}
 	cmd := os.Getenv("SSH_ORIGINAL_COMMAND")
 	if cmd == "" {
 		return
@@ -30,9 +37,9 @@ func runUpdate(c *cli.Context) {
 
 	args := c.Args()
 	if len(args) != 3 {
-		log.GitLogger.Fatal("received less 3 parameters")
+		log.GitLogger.Fatal(2, "received less 3 parameters")
 	} else if args[0] == "" {
-		log.GitLogger.Fatal("refName is empty, shouldn't use")
+		log.GitLogger.Fatal(2, "refName is empty, shouldn't use")
 	}
 
 	uuid := os.Getenv("uuid")
@@ -45,6 +52,6 @@ func runUpdate(c *cli.Context) {
 	}
 
 	if err := models.AddUpdateTask(&task); err != nil {
-		log.GitLogger.Fatal(err.Error())
+		log.GitLogger.Fatal(2, err.Error())
 	}
 }

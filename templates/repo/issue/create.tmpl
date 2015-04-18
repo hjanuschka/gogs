@@ -1,10 +1,10 @@
-{{template "base/head" .}}
+{{template "base/head_old" .}}
 {{template "base/navbar" .}}
 {{template "repo/nav" .}}
 {{template "repo/toolbar" .}}
 <div id="body" class="container">
     <div id="issue">
-        <form class="form" action="{{.RepoLink}}/issues/new" method="post" id="issue-create-form">
+        <form class="form" action="{{.RepoLink}}/issues/new" method="post" id="issue-create-form" enctype="multipart/form-data">
             {{.CsrfTokenHtml}}
             {{template "base/alert" .}}
             <div class="col-md-1">
@@ -71,7 +71,7 @@
                                                 {{range .ClosedMilestones}}
                                                 <li class="milestone-item" data-id="{{.Id}}">
                                                     <p><strong>{{.Name}}</strong></p>
-                                                    <p>Closed {{TimeSince .ClosedDate}}</p>
+                                                    <p>Closed {{TimeSince .ClosedDate $.Lang}}</p>
                                                 </li>
                                                 {{end}}
                                             </ul>
@@ -95,14 +95,26 @@
                     <div class="tab-content">
                         <div class="tab-pane" id="issue-textarea">
                             <div class="form-group">
+                                <div id="submit-error" class="text-danger"></div>
                                 <textarea class="form-control" name="content" id="issue-content" rows="10" placeholder="Write some content" data-ajax-rel="issue-preview" data-ajax-val="val" data-ajax-field="text">{{.content}}</textarea>
                             </div>
                         </div>
                         <div class="tab-pane issue-preview-content" id="issue-preview">loading...</div>
                     </div>
                 </div>
+                {{if .AttachmentsEnabled}}
+                <div id="attached">
+                    <div id="attached-list">
+                        <b>Attachments:</b>
+                    </div>
+                </div>
+                {{end}}
                 <div class="text-right panel-body">
                     <div class="form-group">
+                        {{if .AttachmentsEnabled}}
+                        <input type="file" accept="{{.AllowedTypes}}" style="display: none;" id="attachments-input" name="attachments" multiple />
+                        <button class="btn-default btn attachment-add" id="attachments-button">Select Attachments...</button>
+                        {{end}}
                         <input type="hidden" value="id" name="repo-id"/>
                         <button class="btn-success btn">Create new issue</button>
                     </div>
@@ -111,4 +123,4 @@
         </form>
     </div>
 </div>
-{{template "base/footer" .}}
+{{template "base/footer_old" .}}

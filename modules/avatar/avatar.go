@@ -33,17 +33,29 @@ import (
 	"github.com/nfnt/resize"
 
 	"github.com/gogits/gogs/modules/log"
+	"github.com/gogits/gogs/modules/setting"
 )
 
-var (
-	gravatar = "http://www.gravatar.com/avatar"
-)
+var gravatarSource string
+
+func UpdateGravatarSource() {
+	gravatarSource = setting.GravatarSource
+	log.Debug("avatar.UpdateGravatarSource(gavatar source): %s", gravatarSource)
+	if !strings.HasPrefix(gravatarSource, "http:") {
+		gravatarSource = "http:" + gravatarSource
+		log.Debug("avatar.UpdateGravatarSource(update gavatar source): %s", gravatarSource)
+	}
+}
 
 // hash email to md5 string
-// keep this func in order to make this package indenpent
+// keep this func in order to make this package independent
 func HashEmail(email string) string {
+	// https://en.gravatar.com/site/implement/hash/
+	email = strings.TrimSpace(email)
+	email = strings.ToLower(email)
+
 	h := md5.New()
-	h.Write([]byte(strings.ToLower(email)))
+	h.Write([]byte(email))
 	return hex.EncodeToString(h.Sum(nil))
 }
 
@@ -115,21 +127,23 @@ func (this *Avatar) Encode(wr io.Writer, size int) (err error) {
 	if img, err = decodeImageFile(imgPath); err != nil {
 		return
 	}
-	m := resize.Resize(uint(size), 0, img, resize.Lanczos3)
+	m := resize.Resize(uint(size), 0, img, resize.NearestNeighbor)
 	return jpeg.Encode(wr, m, nil)
 }
 
 // get image from gravatar.com
 func (this *Avatar) Update() {
-	thunder.Fetch(gravatar+"/"+this.Hash+"?"+this.reqParams,
+	UpdateGravatarSource()
+	thunder.Fetch(gravatarSource+this.Hash+"?"+this.reqParams,
 		this.imagePath)
 }
 
 func (this *Avatar) UpdateTimeout(timeout time.Duration) (err error) {
+	UpdateGravatarSource()
 	select {
 	case <-time.After(timeout):
 		err = fmt.Errorf("get gravatar image %s timeout", this.Hash)
-	case err = <-thunder.GoFetch(gravatar+"/"+this.Hash+"?"+this.reqParams,
+	case err = <-thunder.GoFetch(gravatarSource+this.Hash+"?"+this.reqParams,
 		this.imagePath):
 	}
 	return err

@@ -4,7 +4,7 @@
 // Use of this source code is governed by a MIT-style
 // license that can be found in the LICENSE file.
 
-// Gogs(Go Git Service) is a Self Hosted Git Service in the Go Programming Language.
+// Gogs(Go Git Service) is a painless self-hosted Git Service written in Go.
 package main
 
 import (
@@ -17,7 +17,7 @@ import (
 	"github.com/gogits/gogs/modules/setting"
 )
 
-const APP_VER = "0.4.5.0704 Alpha"
+const APP_VER = "0.6.1.0325 Beta"
 
 func init() {
 	runtime.GOMAXPROCS(runtime.NumCPU())
@@ -33,8 +33,8 @@ func main() {
 		cmd.CmdWeb,
 		cmd.CmdServ,
 		cmd.CmdUpdate,
-		cmd.CmdFix,
 		cmd.CmdDump,
+		cmd.CmdCert,
 	}
 	app.Flags = append(app.Flags, []cli.Flag{}...)
 	app.Run(os.Args)

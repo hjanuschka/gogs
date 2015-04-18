@@ -5,36 +5,27 @@
 package apiv1
 
 import (
-	"net/http"
 	"reflect"
 
-	"github.com/go-martini/martini"
+	"github.com/Unknwon/macaron"
+	"github.com/macaron-contrib/binding"
 
 	"github.com/gogits/gogs/modules/auth"
-	"github.com/gogits/gogs/modules/base"
-	"github.com/gogits/gogs/modules/log"
-	"github.com/gogits/gogs/modules/middleware/binding"
 )
 
 type MarkdownForm struct {
-	Text    string `form:"text" binding:"Required"`
+	Text    string `form:"text"`
 	Mode    string `form:"mode"`
 	Context string `form:"context"`
 }
 
-func (f *MarkdownForm) Validate(errs *binding.Errors, req *http.Request, ctx martini.Context) {
-	data := ctx.Get(reflect.TypeOf(base.TmplData{})).Interface().(base.TmplData)
-	validateApiReq(errs, data, f)
+func (f *MarkdownForm) Validate(ctx *macaron.Context, errs binding.Errors) binding.Errors {
+	return validateApiReq(errs, ctx.Data, f)
 }
 
-func validateApiReq(errs *binding.Errors, data base.TmplData, f interface{}) {
-	if errs.Count() == 0 {
-		return
-	} else if len(errs.Overall) > 0 {
-		for _, err := range errs.Overall {
-			log.Error("%s: %v", reflect.TypeOf(f), err)
-		}
-		return
+func validateApiReq(errs binding.Errors, data map[string]interface{}, f auth.Form) binding.Errors {
+	if errs.Len() == 0 {
+		return errs
 	}
 
 	data["HasError"] = true
@@ -56,26 +47,27 @@ func validateApiReq(errs *binding.Errors, data base.TmplData, f interface{}) {
 			continue
 		}
 
-		if err, ok := errs.Fields[field.Name]; ok {
-			switch err {
-			case binding.BindingRequireError:
+		if errs[0].FieldNames[0] == field.Name {
+			switch errs[0].Classification {
+			case binding.ERR_REQUIRED:
 				data["ErrorMsg"] = fieldName + " cannot be empty"
-			case binding.BindingAlphaDashError:
+			case binding.ERR_ALPHA_DASH:
 				data["ErrorMsg"] = fieldName + " must be valid alpha or numeric or dash(-_) characters"
-			case binding.BindingAlphaDashDotError:
+			case binding.ERR_ALPHA_DASH_DOT:
 				data["ErrorMsg"] = fieldName + " must be valid alpha or numeric or dash(-_) or dot characters"
-			case binding.BindingMinSizeError:
-				data["ErrorMsg"] = fieldName + " must contain at least " + auth.GetMinMaxSize(field) + " characters"
-			case binding.BindingMaxSizeError:
-				data["ErrorMsg"] = fieldName + " must contain at most " + auth.GetMinMaxSize(field) + " characters"
-			case binding.BindingEmailError:
+			case binding.ERR_MIN_SIZE:
+				data["ErrorMsg"] = fieldName + " must contain at least " + auth.GetMinSize(field) + " characters"
+			case binding.ERR_MAX_SIZE:
+				data["ErrorMsg"] = fieldName + " must contain at most " + auth.GetMaxSize(field) + " characters"
+			case binding.ERR_EMAIL:
 				data["ErrorMsg"] = fieldName + " is not a valid e-mail address"
-			case binding.BindingUrlError:
+			case binding.ERR_URL:
 				data["ErrorMsg"] = fieldName + " is not a valid URL"
 			default:
-				data["ErrorMsg"] = "Unknown error: " + err
+				data["ErrorMsg"] = "Unknown error: " + errs[0].Classification
 			}
-			return
+			return errs
 		}
 	}
+	return errs
 }

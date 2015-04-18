@@ -5,13 +5,16 @@
 package repo
 
 import (
+	"errors"
 	"fmt"
+	"io"
+	"io/ioutil"
+	"net/http"
 	"net/url"
 	"strings"
 	"time"
 
 	"github.com/Unknwon/com"
-	"github.com/go-martini/martini"
 
 	"github.com/gogits/gogs/models"
 	"github.com/gogits/gogs/modules/auth"
@@ -32,6 +35,11 @@ const (
 	MILESTONE_EDIT base.TplName = "repo/issue/milestone_edit"
 )
 
+var (
+	ErrFileTypeForbidden = errors.New("File type is not allowed")
+	ErrTooManyFiles      = errors.New("Maximum number of files to upload exceeded")
+)
+
 func Issues(ctx *middleware.Context) {
 	ctx.Data["Title"] = "Issues"
 	ctx.Data["IsRepoToolbarIssues"] = true
@@ -46,8 +54,8 @@ func Issues(ctx *middleware.Context) {
 	isShowClosed := ctx.Query("state") == "closed"
 
 	if viewType != "all" && !ctx.IsSigned {
-		ctx.SetCookie("redirect_to", "/"+url.QueryEscape(ctx.Req.RequestURI))
-		ctx.Redirect("/user/login")
+		ctx.SetCookie("redirect_to", "/"+url.QueryEscape(setting.AppSubUrl+ctx.Req.RequestURI), 0, setting.AppSubUrl)
+		ctx.Redirect(setting.AppSubUrl + "/user/login")
 		return
 	}
 
@@ -65,7 +73,7 @@ func Issues(ctx *middleware.Context) {
 	}
 
 	var mid int64
-	midx, _ := base.StrTo(ctx.Query("milestone")).Int64()
+	midx, _ := com.StrTo(ctx.Query("milestone")).Int64()
 	if midx > 0 {
 		mile, err := models.GetMilestoneByIndex(ctx.Repo.Repository.Id, midx)
 		if err != nil {
@@ -86,7 +94,7 @@ func Issues(ctx *middleware.Context) {
 	}
 	ctx.Data["Labels"] = labels
 
-	page, _ := base.StrTo(ctx.Query("page")).Int()
+	page, _ := com.StrTo(ctx.Query("page")).Int()
 
 	// Get issues.
 	issues, err := models.GetIssues(assigneeId, ctx.Repo.Repository.Id, posterId, mid, page,
@@ -106,7 +114,7 @@ func Issues(ctx *middleware.Context) {
 	// Get posters.
 	for i := range issues {
 		if err = issues[i].GetLabels(); err != nil {
-			ctx.Handle(500, "issue.Issues(GetLabels)", fmt.Errorf("[#%d]%v", issues[i].Id, err))
+			ctx.Handle(500, "GetLabels", fmt.Errorf("[#%d]%v", issues[i].Id, err))
 			return
 		}
 
@@ -134,7 +142,7 @@ func Issues(ctx *middleware.Context) {
 	}
 	issueStats := models.GetIssueStats(ctx.Repo.Repository.Id, uid, isShowClosed, filterMode)
 	ctx.Data["IssueStats"] = issueStats
-	ctx.Data["SelectLabels"], _ = base.StrTo(selectLabels).Int64()
+	ctx.Data["SelectLabels"], _ = com.StrTo(selectLabels).Int64()
 	ctx.Data["ViewType"] = viewType
 	ctx.Data["Issues"] = issues
 	ctx.Data["IsShowClosed"] = isShowClosed
@@ -147,10 +155,11 @@ func Issues(ctx *middleware.Context) {
 	ctx.HTML(200, ISSUES)
 }
 
-func CreateIssue(ctx *middleware.Context, params martini.Params) {
+func CreateIssue(ctx *middleware.Context) {
 	ctx.Data["Title"] = "Create issue"
 	ctx.Data["IsRepoToolbarIssues"] = true
 	ctx.Data["IsRepoToolbarIssuesList"] = false
+	ctx.Data["AttachmentsEnabled"] = setting.AttachmentEnabled
 
 	var err error
 	// Get all milestones.
@@ -165,47 +174,63 @@ func CreateIssue(ctx *middleware.Context, params martini.Params) {
 		return
 	}
 
-	us, err := models.GetCollaborators(strings.TrimPrefix(ctx.Repo.RepoLink, "/"))
+	us, err := ctx.Repo.Repository.GetCollaborators()
 	if err != nil {
 		ctx.Handle(500, "issue.CreateIssue(GetCollaborators)", err)
 		return
 	}
+
+	ctx.Data["AllowedTypes"] = setting.AttachmentAllowedTypes
 	ctx.Data["Collaborators"] = us
+
 	ctx.HTML(200, ISSUE_CREATE)
 }
 
-func CreateIssuePost(ctx *middleware.Context, params martini.Params, form auth.CreateIssueForm) {
-	ctx.Data["Title"] = "Create issue"
-	ctx.Data["IsRepoToolbarIssues"] = true
-	ctx.Data["IsRepoToolbarIssuesList"] = false
+func CreateIssuePost(ctx *middleware.Context, form auth.CreateIssueForm) {
+	send := func(status int, data interface{}, err error) {
+		if err != nil {
+			log.Error(4, "issue.CreateIssuePost(?): %s", err)
+
+			ctx.JSON(status, map[string]interface{}{
+				"ok":     false,
+				"status": status,
+				"error":  err.Error(),
+			})
+		} else {
+			ctx.JSON(status, map[string]interface{}{
+				"ok":     true,
+				"status": status,
+				"data":   data,
+			})
+		}
+	}
 
 	var err error
 	// Get all milestones.
-	ctx.Data["OpenMilestones"], err = models.GetMilestones(ctx.Repo.Repository.Id, false)
+	_, err = models.GetMilestones(ctx.Repo.Repository.Id, false)
 	if err != nil {
-		ctx.Handle(500, "issue.ViewIssue(GetMilestones.1): %v", err)
+		send(500, nil, err)
 		return
 	}
-	ctx.Data["ClosedMilestones"], err = models.GetMilestones(ctx.Repo.Repository.Id, true)
+	_, err = models.GetMilestones(ctx.Repo.Repository.Id, true)
 	if err != nil {
-		ctx.Handle(500, "issue.ViewIssue(GetMilestones.2): %v", err)
+		send(500, nil, err)
 		return
 	}
 
-	us, err := models.GetCollaborators(strings.TrimPrefix(ctx.Repo.RepoLink, "/"))
+	_, err = ctx.Repo.Repository.GetCollaborators()
 	if err != nil {
-		ctx.Handle(500, "issue.CreateIssue(GetCollaborators)", err)
+		send(500, nil, err)
 		return
 	}
-	ctx.Data["Collaborators"] = us
 
 	if ctx.HasError() {
-		ctx.HTML(200, ISSUE_CREATE)
+		send(400, nil, errors.New(ctx.Flash.ErrorMsg))
 		return
 	}
 
 	// Only collaborators can assign.
-	if !ctx.Repo.IsOwner {
+	if !ctx.Repo.IsOwner() {
 		form.AssigneeId = 0
 	}
 	issue := &models.Issue{
@@ -219,12 +244,16 @@ func CreateIssuePost(ctx *middleware.Context, params martini.Params, form auth.C
 		Content:     form.Content,
 	}
 	if err := models.NewIssue(issue); err != nil {
-		ctx.Handle(500, "issue.CreateIssue(NewIssue)", err)
+		send(500, nil, err)
 		return
-	} else if err := models.NewIssueUserPairs(issue.RepoId, issue.Id, ctx.Repo.Owner.Id,
-		ctx.User.Id, form.AssigneeId, ctx.Repo.Repository.Name); err != nil {
-		ctx.Handle(500, "issue.CreateIssue(NewIssueUserPairs)", err)
+	} else if err := models.NewIssueUserPairs(ctx.Repo.Repository, issue.Id, ctx.Repo.Owner.Id,
+		ctx.User.Id, form.AssigneeId); err != nil {
+		send(500, nil, err)
 		return
+	}
+
+	if setting.AttachmentEnabled {
+		uploadFiles(ctx, issue.Id, 0)
 	}
 
 	// Update mentions.
@@ -234,20 +263,19 @@ func CreateIssuePost(ctx *middleware.Context, params martini.Params, form auth.C
 			ms[i] = ms[i][1:]
 		}
 
-		ids := models.GetUserIdsByNames(ms)
-		if err := models.UpdateIssueUserPairsByMentions(ids, issue.Id); err != nil {
-			ctx.Handle(500, "issue.CreateIssue(UpdateIssueUserPairsByMentions)", err)
+		if err := models.UpdateMentions(ms, issue.Id); err != nil {
+			send(500, nil, err)
 			return
 		}
 	}
 
 	act := &models.Action{
-		ActUserId:    ctx.User.Id,
+		ActUserID:    ctx.User.Id,
 		ActUserName:  ctx.User.Name,
 		ActEmail:     ctx.User.Email,
-		OpType:       models.OP_CREATE_ISSUE,
+		OpType:       models.CREATE_ISSUE,
 		Content:      fmt.Sprintf("%d|%s", issue.Index, issue.Name),
-		RepoId:       ctx.Repo.Repository.Id,
+		RepoID:       ctx.Repo.Repository.Id,
 		RepoUserName: ctx.Repo.Owner.Name,
 		RepoName:     ctx.Repo.Repository.Name,
 		RefName:      ctx.Repo.BranchName,
@@ -255,7 +283,7 @@ func CreateIssuePost(ctx *middleware.Context, params martini.Params, form auth.C
 	}
 	// Notify watchers.
 	if err := models.NotifyWatchers(act); err != nil {
-		ctx.Handle(500, "issue.CreateIssue(NotifyWatchers)", err)
+		send(500, nil, err)
 		return
 	}
 
@@ -263,7 +291,7 @@ func CreateIssuePost(ctx *middleware.Context, params martini.Params, form auth.C
 	if setting.Service.EnableNotifyMail {
 		tos, err := mailer.SendIssueNotifyMail(ctx.User, ctx.Repo.Owner, ctx.Repo.Repository, issue)
 		if err != nil {
-			ctx.Handle(500, "issue.CreateIssue(SendIssueNotifyMail)", err)
+			send(500, nil, err)
 			return
 		}
 
@@ -278,13 +306,13 @@ func CreateIssuePost(ctx *middleware.Context, params martini.Params, form auth.C
 		}
 		if err = mailer.SendIssueMentionMail(ctx.Render, ctx.User, ctx.Repo.Owner,
 			ctx.Repo.Repository, issue, models.GetUserEmailsByNames(newTos)); err != nil {
-			ctx.Handle(500, "issue.CreateIssue(SendIssueMentionMail)", err)
+			send(500, nil, err)
 			return
 		}
 	}
 	log.Trace("%d Issue created: %d", ctx.Repo.Repository.Id, issue.Id)
 
-	ctx.Redirect(fmt.Sprintf("/%s/%s/issues/%d", params["username"], params["reponame"], issue.Index))
+	send(200, fmt.Sprintf("%s/%s/%s/issues/%d", setting.AppSubUrl, ctx.Params(":username"), ctx.Params(":reponame"), issue.Index), nil)
 }
 
 func checkLabels(labels, allLabels []*models.Label) {
@@ -298,8 +326,10 @@ func checkLabels(labels, allLabels []*models.Label) {
 	}
 }
 
-func ViewIssue(ctx *middleware.Context, params martini.Params) {
-	idx, _ := base.StrTo(params["index"]).Int64()
+func ViewIssue(ctx *middleware.Context) {
+	ctx.Data["AttachmentsEnabled"] = setting.AttachmentEnabled
+
+	idx := com.StrTo(ctx.Params(":index")).MustInt64()
 	if idx == 0 {
 		ctx.Handle(404, "issue.ViewIssue", nil)
 		return
@@ -354,7 +384,7 @@ func ViewIssue(ctx *middleware.Context, params martini.Params) {
 	}
 
 	// Get all collaborators.
-	ctx.Data["Collaborators"], err = models.GetCollaborators(strings.TrimPrefix(ctx.Repo.RepoLink, "/"))
+	ctx.Data["Collaborators"], err = ctx.Repo.Repository.GetCollaborators()
 	if err != nil {
 		ctx.Handle(500, "issue.CreateIssue(GetCollaborators)", err)
 		return
@@ -393,20 +423,25 @@ func ViewIssue(ctx *middleware.Context, params martini.Params) {
 			return
 		}
 		comments[i].Poster = u
-		comments[i].Content = string(base.RenderMarkdown([]byte(comments[i].Content), ctx.Repo.RepoLink))
+
+		if comments[i].Type == models.COMMENT_TYPE_COMMENT {
+			comments[i].Content = string(base.RenderMarkdown([]byte(comments[i].Content), ctx.Repo.RepoLink))
+		}
 	}
+
+	ctx.Data["AllowedTypes"] = setting.AttachmentAllowedTypes
 
 	ctx.Data["Title"] = issue.Name
 	ctx.Data["Issue"] = issue
 	ctx.Data["Comments"] = comments
-	ctx.Data["IsIssueOwner"] = ctx.Repo.IsOwner || (ctx.IsSigned && issue.PosterId == ctx.User.Id)
+	ctx.Data["IsIssueOwner"] = ctx.Repo.IsOwner() || (ctx.IsSigned && issue.PosterId == ctx.User.Id)
 	ctx.Data["IsRepoToolbarIssues"] = true
 	ctx.Data["IsRepoToolbarIssuesList"] = false
 	ctx.HTML(200, ISSUE_VIEW)
 }
 
-func UpdateIssue(ctx *middleware.Context, params martini.Params, form auth.CreateIssueForm) {
-	idx, _ := base.StrTo(params["index"]).Int64()
+func UpdateIssue(ctx *middleware.Context, form auth.CreateIssueForm) {
+	idx := com.StrTo(ctx.Params(":index")).MustInt64()
 	if idx <= 0 {
 		ctx.Error(404)
 		return
@@ -422,15 +457,15 @@ func UpdateIssue(ctx *middleware.Context, params martini.Params, form auth.Creat
 		return
 	}
 
-	if ctx.User.Id != issue.PosterId && !ctx.Repo.IsOwner {
+	if ctx.User.Id != issue.PosterId && !ctx.Repo.IsOwner() {
 		ctx.Error(403)
 		return
 	}
 
 	issue.Name = form.IssueName
-	issue.MilestoneId = form.MilestoneId
-	issue.AssigneeId = form.AssigneeId
-	issue.LabelIds = form.Labels
+	//issue.MilestoneId = form.MilestoneId
+	//issue.AssigneeId = form.AssigneeId
+	//issue.LabelIds = form.Labels
 	issue.Content = form.Content
 	// try get content from text, ignore conflict with preview ajax
 	if form.Content == "" {
@@ -448,13 +483,13 @@ func UpdateIssue(ctx *middleware.Context, params martini.Params, form auth.Creat
 	})
 }
 
-func UpdateIssueLabel(ctx *middleware.Context, params martini.Params) {
-	if !ctx.Repo.IsOwner {
+func UpdateIssueLabel(ctx *middleware.Context) {
+	if !ctx.Repo.IsOwner() {
 		ctx.Error(403)
 		return
 	}
 
-	idx, _ := base.StrTo(params["index"]).Int64()
+	idx := com.StrTo(ctx.Params(":index")).MustInt64()
 	if idx <= 0 {
 		ctx.Error(404)
 		return
@@ -472,7 +507,7 @@ func UpdateIssueLabel(ctx *middleware.Context, params martini.Params) {
 
 	isAttach := ctx.Query("action") == "attach"
 	labelStrId := ctx.Query("id")
-	labelId, _ := base.StrTo(labelStrId).Int64()
+	labelId := com.StrTo(labelStrId).MustInt64()
 	label, err := models.GetLabelById(labelId)
 	if err != nil {
 		if err == models.ErrLabelNotExist {
@@ -514,6 +549,7 @@ func UpdateIssueLabel(ctx *middleware.Context, params martini.Params) {
 				label.NumClosedIssues--
 			}
 		}
+
 		if err = models.UpdateLabel(label); err != nil {
 			ctx.Handle(500, "issue.UpdateIssueLabel(UpdateLabel)", err)
 			return
@@ -525,13 +561,13 @@ func UpdateIssueLabel(ctx *middleware.Context, params martini.Params) {
 }
 
 func UpdateIssueMilestone(ctx *middleware.Context) {
-	if !ctx.Repo.IsOwner {
+	if !ctx.Repo.IsOwner() {
 		ctx.Error(403)
 		return
 	}
 
-	issueId, err := base.StrTo(ctx.Query("issue")).Int64()
-	if err != nil {
+	issueId := com.StrTo(ctx.Query("issue")).MustInt64()
+	if issueId == 0 {
 		ctx.Error(404)
 		return
 	}
@@ -547,7 +583,7 @@ func UpdateIssueMilestone(ctx *middleware.Context) {
 	}
 
 	oldMid := issue.MilestoneId
-	mid, _ := base.StrTo(ctx.Query("milestone")).Int64()
+	mid := com.StrTo(ctx.Query("milestoneid")).MustInt64()
 	if oldMid == mid {
 		ctx.JSON(200, map[string]interface{}{
 			"ok": true,
@@ -571,13 +607,13 @@ func UpdateIssueMilestone(ctx *middleware.Context) {
 }
 
 func UpdateAssignee(ctx *middleware.Context) {
-	if !ctx.Repo.IsOwner {
+	if !ctx.Repo.IsOwner() {
 		ctx.Error(403)
 		return
 	}
 
-	issueId, err := base.StrTo(ctx.Query("issue")).Int64()
-	if err != nil {
+	issueId := com.StrTo(ctx.Query("issue")).MustInt64()
+	if issueId == 0 {
 		ctx.Error(404)
 		return
 	}
@@ -585,21 +621,21 @@ func UpdateAssignee(ctx *middleware.Context) {
 	issue, err := models.GetIssueById(issueId)
 	if err != nil {
 		if err == models.ErrIssueNotExist {
-			ctx.Handle(404, "issue.UpdateAssignee(GetIssueById)", err)
+			ctx.Handle(404, "GetIssueById", err)
 		} else {
-			ctx.Handle(500, "issue.UpdateAssignee(GetIssueById)", err)
+			ctx.Handle(500, "GetIssueById", err)
 		}
 		return
 	}
 
-	aid, _ := base.StrTo(ctx.Query("assigneeid")).Int64()
-	// Not check for invalid assignne id and give responsibility to owners.
+	aid := com.StrTo(ctx.Query("assigneeid")).MustInt64()
+	// Not check for invalid assignee id and give responsibility to owners.
 	issue.AssigneeId = aid
 	if err = models.UpdateIssueUserPairByAssignee(aid, issue.Id); err != nil {
-		ctx.Handle(500, "issue.UpdateAssignee(UpdateIssueUserPairByAssignee): %v", err)
+		ctx.Handle(500, "UpdateIssueUserPairByAssignee: %v", err)
 		return
 	} else if err = models.UpdateIssue(issue); err != nil {
-		ctx.Handle(500, "issue.UpdateAssignee(UpdateIssue)", err)
+		ctx.Handle(500, "UpdateIssue", err)
 		return
 	}
 
@@ -608,26 +644,116 @@ func UpdateAssignee(ctx *middleware.Context) {
 	})
 }
 
-func Comment(ctx *middleware.Context, params martini.Params) {
-	index, err := base.StrTo(ctx.Query("issueIndex")).Int64()
-	if err != nil {
-		ctx.Handle(404, "issue.Comment(get index)", err)
+func uploadFiles(ctx *middleware.Context, issueId, commentId int64) {
+	if !setting.AttachmentEnabled {
+		return
+	}
+
+	allowedTypes := strings.Split(setting.AttachmentAllowedTypes, "|")
+	attachments := ctx.Req.MultipartForm.File["attachments"]
+
+	if len(attachments) > setting.AttachmentMaxFiles {
+		ctx.Handle(400, "issue.Comment", ErrTooManyFiles)
+		return
+	}
+
+	for _, header := range attachments {
+		file, err := header.Open()
+
+		if err != nil {
+			ctx.Handle(500, "issue.Comment(header.Open)", err)
+			return
+		}
+
+		defer file.Close()
+
+		buf := make([]byte, 1024)
+		n, _ := file.Read(buf)
+		if n > 0 {
+			buf = buf[:n]
+		}
+		fileType := http.DetectContentType(buf)
+		fmt.Println(fileType)
+
+		allowed := false
+
+		for _, t := range allowedTypes {
+			t := strings.Trim(t, " ")
+
+			if t == "*/*" || t == fileType {
+				allowed = true
+				break
+			}
+		}
+
+		if !allowed {
+			ctx.Handle(400, "issue.Comment", ErrFileTypeForbidden)
+			return
+		}
+
+		out, err := ioutil.TempFile(setting.AttachmentPath, "attachment_")
+
+		if err != nil {
+			ctx.Handle(500, "ioutil.TempFile", err)
+			return
+		}
+
+		defer out.Close()
+
+		out.Write(buf)
+		_, err = io.Copy(out, file)
+		if err != nil {
+			ctx.Handle(500, "io.Copy", err)
+			return
+		}
+
+		_, err = models.CreateAttachment(issueId, commentId, header.Filename, out.Name())
+		if err != nil {
+			ctx.Handle(500, "CreateAttachment", err)
+			return
+		}
+	}
+}
+
+func Comment(ctx *middleware.Context) {
+	send := func(status int, data interface{}, err error) {
+		if err != nil {
+			log.Error(4, "issue.Comment(?): %s", err)
+
+			ctx.JSON(status, map[string]interface{}{
+				"ok":     false,
+				"status": status,
+				"error":  err.Error(),
+			})
+		} else {
+			ctx.JSON(status, map[string]interface{}{
+				"ok":     true,
+				"status": status,
+				"data":   data,
+			})
+		}
+	}
+
+	index := com.StrTo(ctx.Query("issueIndex")).MustInt64()
+	if index == 0 {
+		ctx.Error(404)
 		return
 	}
 
 	issue, err := models.GetIssueByIndex(ctx.Repo.Repository.Id, index)
 	if err != nil {
 		if err == models.ErrIssueNotExist {
-			ctx.Handle(404, "issue.Comment", err)
+			send(404, nil, err)
 		} else {
-			ctx.Handle(200, "issue.Comment(get issue)", err)
+			send(200, nil, err)
 		}
+
 		return
 	}
 
 	// Check if issue owner changes the status of issue.
 	var newStatus string
-	if ctx.Repo.IsOwner || issue.PosterId == ctx.User.Id {
+	if ctx.Repo.IsOwner() || issue.PosterId == ctx.User.Id {
 		newStatus = ctx.Query("change_status")
 	}
 	if len(newStatus) > 0 {
@@ -635,33 +761,61 @@ func Comment(ctx *middleware.Context, params martini.Params) {
 			(strings.Contains(newStatus, "Close") && !issue.IsClosed) {
 			issue.IsClosed = !issue.IsClosed
 			if err = models.UpdateIssue(issue); err != nil {
-				ctx.Handle(500, "issue.Comment(UpdateIssue)", err)
+				send(500, nil, err)
 				return
 			} else if err = models.UpdateIssueUserPairsByStatus(issue.Id, issue.IsClosed); err != nil {
-				ctx.Handle(500, "issue.Comment(UpdateIssueUserPairsByStatus)", err)
+				send(500, nil, err)
 				return
 			}
 
-			cmtType := models.IT_CLOSE
-			if !issue.IsClosed {
-				cmtType = models.IT_REOPEN
+			if err = issue.GetLabels(); err != nil {
+				send(500, nil, err)
+				return
 			}
 
-			if err = models.CreateComment(ctx.User.Id, ctx.Repo.Repository.Id, issue.Id, 0, 0, cmtType, ""); err != nil {
-				ctx.Handle(200, "issue.Comment(create status change comment)", err)
+			for _, label := range issue.Labels {
+				if issue.IsClosed {
+					label.NumClosedIssues++
+				} else {
+					label.NumClosedIssues--
+				}
+
+				if err = models.UpdateLabel(label); err != nil {
+					send(500, nil, err)
+					return
+				}
+			}
+
+			// Change open/closed issue counter for the associated milestone
+			if issue.MilestoneId > 0 {
+				if err = models.ChangeMilestoneIssueStats(issue); err != nil {
+					send(500, nil, err)
+				}
+			}
+
+			cmtType := models.COMMENT_TYPE_CLOSE
+			if !issue.IsClosed {
+				cmtType = models.COMMENT_TYPE_REOPEN
+			}
+
+			if _, err = models.CreateComment(ctx.User.Id, ctx.Repo.Repository.Id, issue.Id, 0, 0, cmtType, "", nil); err != nil {
+				send(200, nil, err)
 				return
 			}
 			log.Trace("%s Issue(%d) status changed: %v", ctx.Req.RequestURI, issue.Id, !issue.IsClosed)
 		}
 	}
 
+	var comment *models.Comment
+
 	var ms []string
 	content := ctx.Query("content")
-	if len(content) > 0 {
-		switch params["action"] {
+	// Fix #321. Allow empty comments, as long as we have attachments.
+	if len(content) > 0 || len(ctx.Req.MultipartForm.File["attachments"]) > 0 {
+		switch ctx.Params(":action") {
 		case "new":
-			if err = models.CreateComment(ctx.User.Id, ctx.Repo.Repository.Id, issue.Id, 0, 0, models.IT_PLAIN, content); err != nil {
-				ctx.Handle(500, "issue.Comment(create comment)", err)
+			if comment, err = models.CreateComment(ctx.User.Id, ctx.Repo.Repository.Id, issue.Id, 0, 0, models.COMMENT_TYPE_COMMENT, content, nil); err != nil {
+				send(500, nil, err)
 				return
 			}
 
@@ -672,9 +826,8 @@ func Comment(ctx *middleware.Context, params martini.Params) {
 					ms[i] = ms[i][1:]
 				}
 
-				ids := models.GetUserIdsByNames(ms)
-				if err := models.UpdateIssueUserPairsByMentions(ids, issue.Id); err != nil {
-					ctx.Handle(500, "issue.CreateIssue(UpdateIssueUserPairsByMentions)", err)
+				if err := models.UpdateMentions(ms, issue.Id); err != nil {
+					send(500, nil, err)
 					return
 				}
 			}
@@ -686,19 +839,23 @@ func Comment(ctx *middleware.Context, params martini.Params) {
 		}
 	}
 
+	if comment != nil {
+		uploadFiles(ctx, issue.Id, comment.Id)
+	}
+
 	// Notify watchers.
 	act := &models.Action{
-		ActUserId:    ctx.User.Id,
+		ActUserID:    ctx.User.Id,
 		ActUserName:  ctx.User.LowerName,
 		ActEmail:     ctx.User.Email,
-		OpType:       models.OP_COMMENT_ISSUE,
+		OpType:       models.COMMENT_ISSUE,
 		Content:      fmt.Sprintf("%d|%s", issue.Index, strings.Split(content, "\n")[0]),
-		RepoId:       ctx.Repo.Repository.Id,
+		RepoID:       ctx.Repo.Repository.Id,
 		RepoUserName: ctx.Repo.Owner.LowerName,
 		RepoName:     ctx.Repo.Repository.LowerName,
 	}
 	if err = models.NotifyWatchers(act); err != nil {
-		ctx.Handle(500, "issue.CreateIssue(NotifyWatchers)", err)
+		send(500, nil, err)
 		return
 	}
 
@@ -707,7 +864,7 @@ func Comment(ctx *middleware.Context, params martini.Params) {
 		issue.Content = content
 		tos, err := mailer.SendIssueNotifyMail(ctx.User, ctx.Repo.Owner, ctx.Repo.Repository, issue)
 		if err != nil {
-			ctx.Handle(500, "issue.Comment(SendIssueNotifyMail)", err)
+			send(500, nil, err)
 			return
 		}
 
@@ -722,12 +879,12 @@ func Comment(ctx *middleware.Context, params martini.Params) {
 		}
 		if err = mailer.SendIssueMentionMail(ctx.Render, ctx.User, ctx.Repo.Owner,
 			ctx.Repo.Repository, issue, models.GetUserEmailsByNames(newTos)); err != nil {
-			ctx.Handle(500, "issue.Comment(SendIssueMentionMail)", err)
+			send(500, nil, err)
 			return
 		}
 	}
 
-	ctx.Redirect(fmt.Sprintf("%s/issues/%d", ctx.Repo.RepoLink, index))
+	send(200, fmt.Sprintf("%s/issues/%d", ctx.Repo.RepoLink, index), nil)
 }
 
 func NewLabel(ctx *middleware.Context, form auth.CreateLabelForm) {
@@ -748,8 +905,8 @@ func NewLabel(ctx *middleware.Context, form auth.CreateLabelForm) {
 	ctx.Redirect(ctx.Repo.RepoLink + "/issues")
 }
 
-func UpdateLabel(ctx *middleware.Context, params martini.Params, form auth.CreateLabelForm) {
-	id, _ := base.StrTo(ctx.Query("id")).Int64()
+func UpdateLabel(ctx *middleware.Context, form auth.CreateLabelForm) {
+	id := com.StrTo(ctx.Query("id")).MustInt64()
 	if id == 0 {
 		ctx.Error(404)
 		return
@@ -802,7 +959,7 @@ func Milestones(ctx *middleware.Context) {
 		return
 	}
 	for _, m := range miles {
-		m.RenderedContent = string(base.RenderSpecialLink([]byte(m.Content), ctx.Repo.RepoLink))
+		m.RenderedContent = string(base.RenderMarkdown([]byte(m.Content), ctx.Repo.RepoLink))
 		m.CalOpenIssues()
 	}
 	ctx.Data["Milestones"] = miles
@@ -858,12 +1015,12 @@ func NewMilestonePost(ctx *middleware.Context, form auth.CreateMilestoneForm) {
 	ctx.Redirect(ctx.Repo.RepoLink + "/issues/milestones")
 }
 
-func UpdateMilestone(ctx *middleware.Context, params martini.Params) {
+func UpdateMilestone(ctx *middleware.Context) {
 	ctx.Data["Title"] = "Update Milestone"
 	ctx.Data["IsRepoToolbarIssues"] = true
 	ctx.Data["IsRepoToolbarIssuesList"] = true
 
-	idx, _ := base.StrTo(params["index"]).Int64()
+	idx := com.StrTo(ctx.Params(":index")).MustInt64()
 	if idx == 0 {
 		ctx.Handle(404, "issue.UpdateMilestone", nil)
 		return
@@ -879,7 +1036,7 @@ func UpdateMilestone(ctx *middleware.Context, params martini.Params) {
 		return
 	}
 
-	action := params["action"]
+	action := ctx.Params(":action")
 	if len(action) > 0 {
 		switch action {
 		case "open":
@@ -916,12 +1073,12 @@ func UpdateMilestone(ctx *middleware.Context, params martini.Params) {
 	ctx.HTML(200, MILESTONE_EDIT)
 }
 
-func UpdateMilestonePost(ctx *middleware.Context, params martini.Params, form auth.CreateMilestoneForm) {
+func UpdateMilestonePost(ctx *middleware.Context, form auth.CreateMilestoneForm) {
 	ctx.Data["Title"] = "Update Milestone"
 	ctx.Data["IsRepoToolbarIssues"] = true
 	ctx.Data["IsRepoToolbarIssuesList"] = true
 
-	idx, _ := base.StrTo(params["index"]).Int64()
+	idx := com.StrTo(ctx.Params(":index")).MustInt64()
 	if idx == 0 {
 		ctx.Handle(404, "issue.UpdateMilestonePost", nil)
 		return
@@ -961,4 +1118,41 @@ func UpdateMilestonePost(ctx *middleware.Context, params martini.Params, form au
 	}
 
 	ctx.Redirect(ctx.Repo.RepoLink + "/issues/milestones")
+}
+
+func IssueGetAttachment(ctx *middleware.Context) {
+	id := com.StrTo(ctx.Params(":id")).MustInt64()
+	if id == 0 {
+		ctx.Error(404)
+		return
+	}
+
+	attachment, err := models.GetAttachmentById(id)
+
+	if err != nil {
+		ctx.Handle(404, "issue.IssueGetAttachment(models.GetAttachmentById)", err)
+		return
+	}
+
+	// Fix #312. Attachments with , in their name are not handled correctly by Google Chrome.
+	// We must put the name in " manually.
+	ctx.ServeFile(attachment.Path, "\""+attachment.Name+"\"")
+}
+
+// testing route handler for new issue ui page
+// todo : move to Issue() function
+func Issues2(ctx *middleware.Context) {
+	ctx.HTML(200, "repo/issue2/list")
+}
+
+func PullRequest2(ctx *middleware.Context) {
+	ctx.HTML(200, "repo/pr2/list")
+}
+
+func Labels2(ctx *middleware.Context) {
+	ctx.HTML(200, "repo/issue2/labels")
+}
+
+func Milestones2(ctx *middleware.Context) {
+	ctx.HTML(200, "repo/milestone2/list")
 }

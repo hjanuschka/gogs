@@ -10,7 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/go-martini/martini"
+	"github.com/Unknwon/com"
+	"github.com/Unknwon/macaron"
 
 	"github.com/gogits/gogs/models"
 	"github.com/gogits/gogs/modules/base"
@@ -21,16 +22,14 @@ import (
 )
 
 const (
-	DASHBOARD       base.TplName = "admin/dashboard"
-	USERS           base.TplName = "admin/users"
-	REPOS           base.TplName = "admin/repos"
-	AUTHS           base.TplName = "admin/auths"
-	CONFIG          base.TplName = "admin/config"
-	MONITOR_PROCESS base.TplName = "admin/monitor/process"
-	MONITOR_CRON    base.TplName = "admin/monitor/cron"
+	DASHBOARD base.TplName = "admin/dashboard"
+	CONFIG    base.TplName = "admin/config"
+	MONITOR   base.TplName = "admin/monitor"
 )
 
-var startTime = time.Now()
+var (
+	startTime = time.Now()
+)
 
 var sysStatus struct {
 	Uptime       string
@@ -117,25 +116,42 @@ type AdminOperation int
 const (
 	CLEAN_UNBIND_OAUTH AdminOperation = iota + 1
 	CLEAN_INACTIVATE_USER
+	CLEAN_REPO_ARCHIVES
+	GIT_GC_REPOS
+	SYNC_SSH_AUTHORIZED_KEY
+	SYNC_REPOSITORY_UPDATE_HOOK
 )
 
 func Dashboard(ctx *middleware.Context) {
-	ctx.Data["Title"] = "Admin Dashboard"
-	ctx.Data["PageIsDashboard"] = true
+	ctx.Data["Title"] = ctx.Tr("admin.dashboard")
+	ctx.Data["PageIsAdmin"] = true
+	ctx.Data["PageIsAdminDashboard"] = true
 
 	// Run operation.
-	op, _ := base.StrTo(ctx.Query("op")).Int()
+	op, _ := com.StrTo(ctx.Query("op")).Int()
 	if op > 0 {
 		var err error
 		var success string
 
 		switch AdminOperation(op) {
 		case CLEAN_UNBIND_OAUTH:
-			success = "All unbind OAuthes have been deleted."
+			success = ctx.Tr("admin.dashboard.clean_unbind_oauth_success")
 			err = models.CleanUnbindOauth()
 		case CLEAN_INACTIVATE_USER:
-			success = "All inactivate accounts have been deleted."
+			success = ctx.Tr("admin.dashboard.delete_inactivate_accounts_success")
 			err = models.DeleteInactivateUsers()
+		case CLEAN_REPO_ARCHIVES:
+			success = ctx.Tr("admin.dashboard.delete_repo_archives_success")
+			err = models.DeleteRepositoryArchives()
+		case GIT_GC_REPOS:
+			success = ctx.Tr("admin.dashboard.git_gc_repos_success")
+			err = models.GitGcRepos()
+		case SYNC_SSH_AUTHORIZED_KEY:
+			success = ctx.Tr("admin.dashboard.resync_all_sshkeys_success")
+			err = models.RewriteAllPublicKeys()
+		case SYNC_REPOSITORY_UPDATE_HOOK:
+			success = ctx.Tr("admin.dashboard.resync_all_update_hooks_success")
+			err = models.RewriteRepositoryUpdateHook()
 		}
 
 		if err != nil {
@@ -143,65 +159,28 @@ func Dashboard(ctx *middleware.Context) {
 		} else {
 			ctx.Flash.Success(success)
 		}
-		ctx.Redirect("/admin")
+		ctx.Redirect(setting.AppSubUrl + "/admin")
 		return
 	}
 
 	ctx.Data["Stats"] = models.GetStatistic()
+	// FIXME: update periodically
 	updateSystemStatus()
 	ctx.Data["SysStatus"] = sysStatus
 	ctx.HTML(200, DASHBOARD)
 }
 
-func Users(ctx *middleware.Context) {
-	ctx.Data["Title"] = "User Management"
-	ctx.Data["PageIsUsers"] = true
-
-	var err error
-	ctx.Data["Users"], err = models.GetUsers(200, 0)
-	if err != nil {
-		ctx.Handle(500, "admin.Users(GetUsers)", err)
-		return
-	}
-	ctx.HTML(200, USERS)
-}
-
-func Repositories(ctx *middleware.Context) {
-	ctx.Data["Title"] = "Repository Management"
-	ctx.Data["PageIsRepos"] = true
-
-	var err error
-	ctx.Data["Repos"], err = models.GetRepositoriesWithUsers(200, 0)
-	if err != nil {
-		ctx.Handle(500, "admin.Repositories", err)
-		return
-	}
-	ctx.HTML(200, REPOS)
-}
-
-func Auths(ctx *middleware.Context) {
-	ctx.Data["Title"] = "Auth Sources"
-	ctx.Data["PageIsAuths"] = true
-
-	var err error
-	ctx.Data["Sources"], err = models.GetAuths()
-	if err != nil {
-		ctx.Handle(500, "admin.Auths", err)
-		return
-	}
-	ctx.HTML(200, AUTHS)
-}
-
 func Config(ctx *middleware.Context) {
-	ctx.Data["Title"] = "Server Configuration"
-	ctx.Data["PageIsConfig"] = true
+	ctx.Data["Title"] = ctx.Tr("admin.users")
+	ctx.Data["PageIsAdmin"] = true
+	ctx.Data["PageIsAdminConfig"] = true
 
 	ctx.Data["AppUrl"] = setting.AppUrl
 	ctx.Data["Domain"] = setting.Domain
 	ctx.Data["OfflineMode"] = setting.OfflineMode
 	ctx.Data["DisableRouterLog"] = setting.DisableRouterLog
 	ctx.Data["RunUser"] = setting.RunUser
-	ctx.Data["RunMode"] = strings.Title(martini.Env)
+	ctx.Data["RunMode"] = strings.Title(macaron.Env)
 	ctx.Data["RepoRootPath"] = setting.RepoRootPath
 	ctx.Data["StaticRootPath"] = setting.StaticRootPath
 	ctx.Data["LogRootPath"] = setting.LogRootPath
@@ -209,11 +188,8 @@ func Config(ctx *middleware.Context) {
 	ctx.Data["ReverseProxyAuthUser"] = setting.ReverseProxyAuthUser
 
 	ctx.Data["Service"] = setting.Service
-
 	ctx.Data["DbCfg"] = models.DbCfg
-
-	ctx.Data["WebhookTaskInterval"] = setting.WebhookTaskInterval
-	ctx.Data["WebhookDeliverTimeout"] = setting.WebhookDeliverTimeout
+	ctx.Data["Webhook"] = setting.Webhook
 
 	ctx.Data["MailerEnabled"] = false
 	if setting.MailService != nil {
@@ -228,9 +204,9 @@ func Config(ctx *middleware.Context) {
 	}
 
 	ctx.Data["CacheAdapter"] = setting.CacheAdapter
-	ctx.Data["CacheConfig"] = setting.CacheConfig
+	ctx.Data["CacheInternal"] = setting.CacheInternal
+	ctx.Data["CacheConn"] = setting.CacheConn
 
-	ctx.Data["SessionProvider"] = setting.SessionProvider
 	ctx.Data["SessionConfig"] = setting.SessionConfig
 
 	ctx.Data["PictureService"] = setting.PictureService
@@ -249,18 +225,10 @@ func Config(ctx *middleware.Context) {
 }
 
 func Monitor(ctx *middleware.Context) {
-	ctx.Data["Title"] = "Monitoring Center"
-	ctx.Data["PageIsMonitor"] = true
-
-	tab := ctx.Query("tab")
-	switch tab {
-	case "process":
-		ctx.Data["PageIsMonitorProcess"] = true
-		ctx.Data["Processes"] = process.Processes
-		ctx.HTML(200, MONITOR_PROCESS)
-	default:
-		ctx.Data["PageIsMonitorCron"] = true
-		ctx.Data["Entries"] = cron.ListEntries()
-		ctx.HTML(200, MONITOR_CRON)
-	}
+	ctx.Data["Title"] = ctx.Tr("admin.monitor")
+	ctx.Data["PageIsAdmin"] = true
+	ctx.Data["PageIsAdminMonitor"] = true
+	ctx.Data["Processes"] = process.Processes
+	ctx.Data["Entries"] = cron.ListEntries()
+	ctx.HTML(200, MONITOR)
 }

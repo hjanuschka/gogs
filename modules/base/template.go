@@ -5,7 +5,6 @@
 package base
 
 import (
-	"bytes"
 	"container/list"
 	"encoding/json"
 	"fmt"
@@ -14,11 +13,15 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/net/html/charset"
+	"golang.org/x/text/transform"
+
+	"github.com/gogits/chardet"
 	"github.com/gogits/gogs/modules/setting"
 )
 
 func Str2html(raw string) template.HTML {
-	return template.HTML(raw)
+	return template.HTML(Sanitizer.Sanitize(raw))
 }
 
 func Range(l int) []int {
@@ -38,11 +41,58 @@ func List(l *list.List) chan interface{} {
 	return c
 }
 
+func Sha1(str string) string {
+	return EncodeSha1(str)
+}
+
 func ShortSha(sha1 string) string {
 	if len(sha1) == 40 {
 		return sha1[:10]
 	}
 	return sha1
+}
+
+func DetectEncoding(content []byte) (string, error) {
+	detector := chardet.NewTextDetector()
+	result, err := detector.DetectBest(content)
+	return result.Charset, err
+}
+
+func ToUtf8WithErr(content []byte) (error, string) {
+	charsetLabel, err := DetectEncoding(content)
+	if err != nil {
+		return err, ""
+	}
+
+	if charsetLabel == "utf8" {
+		return nil, string(content)
+	}
+
+	encoding, _ := charset.Lookup(charsetLabel)
+
+	if encoding == nil {
+		return fmt.Errorf("unknow char decoder %s", charsetLabel), string(content)
+	}
+
+	result, n, err := transform.String(encoding.NewDecoder(), string(content))
+
+	// If there is an error, we concatenate the nicely decoded part and the
+	// original left over. This way we won't loose data.
+	if err != nil {
+		result = result + string(content[n:])
+	}
+
+	return err, result
+}
+
+func ToUtf8(content string) string {
+	_, res := ToUtf8WithErr([]byte(content))
+	return res
+}
+
+// RenderCommitMessage renders commit message with XSS-safe and special links.
+func RenderCommitMessage(msg, urlPrefix string) template.HTML {
+	return template.HTML(string(RenderIssueIndexPattern([]byte(template.HTMLEscapeString(msg)), urlPrefix)))
 }
 
 var mailDomains = map[string]string{
@@ -51,10 +101,13 @@ var mailDomains = map[string]string{
 
 var TemplateFuncs template.FuncMap = map[string]interface{}{
 	"GoVer": func() string {
-		return runtime.Version()
+		return strings.Title(runtime.Version())
 	},
 	"AppName": func() string {
 		return setting.AppName
+	},
+	"AppSubUrl": func() string {
+		return setting.AppSubUrl
 	},
 	"AppVer": func() string {
 		return setting.AppVer
@@ -65,11 +118,14 @@ var TemplateFuncs template.FuncMap = map[string]interface{}{
 	"CdnMode": func() bool {
 		return setting.ProdMode && !setting.OfflineMode
 	},
+	"DisableGravatar": func() bool {
+		return setting.DisableGravatar
+	},
 	"LoadTimes": func(startTime time.Time) string {
 		return fmt.Sprint(time.Since(startTime).Nanoseconds()/1e6) + "ms"
 	},
 	"AvatarLink": AvatarLink,
-	"str2html":   Str2html,
+	"Str2html":   Str2html,
 	"TimeSince":  TimeSince,
 	"FileSize":   FileSize,
 	"Subtract":   Subtract,
@@ -77,12 +133,16 @@ var TemplateFuncs template.FuncMap = map[string]interface{}{
 		return a + b
 	},
 	"ActionIcon": ActionIcon,
-	"ActionDesc": ActionDesc,
-	"DateFormat": DateFormat,
-	"List":       List,
+	"DateFmtLong": func(t time.Time) string {
+		return t.Format(time.RFC1123Z)
+	},
+	"DateFmtShort": func(t time.Time) string {
+		return t.Format("Jan 02, 2006")
+	},
+	"List": List,
 	"Mail2Domain": func(mail string) string {
 		if !strings.Contains(mail, "@") {
-			return "try.gogits.org"
+			return "try.gogs.io"
 		}
 
 		suffix := strings.SplitN(mail, "@", 2)[1]
@@ -93,13 +153,31 @@ var TemplateFuncs template.FuncMap = map[string]interface{}{
 		return domain
 	},
 	"SubStr": func(str string, start, length int) string {
-		return str[start : start+length]
+		if len(str) == 0 {
+			return ""
+		}
+		end := start + length
+		if length == -1 {
+			end = len(str)
+		}
+		if len(str) < end {
+			return str
+		}
+		return str[start:end]
 	},
 	"DiffTypeToStr":     DiffTypeToStr,
 	"DiffLineTypeToStr": DiffLineTypeToStr,
+	"Sha1":              Sha1,
 	"ShortSha":          ShortSha,
-	"Oauth2Icon":        Oauth2Icon,
-	"Oauth2Name":        Oauth2Name,
+	"Md5":               EncodeMd5,
+	"ActionContent2Commits": ActionContent2Commits,
+	"Oauth2Icon":            Oauth2Icon,
+	"Oauth2Name":            Oauth2Name,
+	"ToUtf8":                ToUtf8,
+	"EscapePound": func(str string) string {
+		return strings.Replace(str, "#", "%23", -1)
+	},
+	"RenderCommitMessage": RenderCommitMessage,
 }
 
 type Actioner interface {
@@ -116,32 +194,18 @@ type Actioner interface {
 // and returns a icon class name.
 func ActionIcon(opType int) string {
 	switch opType {
-	case 1: // Create repository.
-		return "plus-circle"
+	case 1, 8: // Create, transfer repository.
+		return "repo"
 	case 5, 9: // Commit repository.
-		return "arrow-circle-o-right"
+		return "git-commit"
 	case 6: // Create issue.
-		return "exclamation-circle"
-	case 8: // Transfer repository.
-		return "share"
+		return "issue-opened"
 	case 10: // Comment issue.
 		return "comment"
 	default:
 		return "invalid type"
 	}
 }
-
-const (
-	TPL_CREATE_REPO    = `<a href="/user/%s">%s</a> created repository <a href="/%s">%s</a>`
-	TPL_COMMIT_REPO    = `<a href="/user/%s">%s</a> pushed to <a href="/%s/src/%s">%s</a> at <a href="/%s">%s</a>%s`
-	TPL_COMMIT_REPO_LI = `<div><img src="%s?s=16" alt="user-avatar"/> <a href="/%s/commit/%s" rel="nofollow">%s</a> %s</div>`
-	TPL_CREATE_ISSUE   = `<a href="/user/%s">%s</a> opened issue <a href="/%s/issues/%s">%s#%s</a>
-<div><img src="%s?s=16" alt="user-avatar"/> %s</div>`
-	TPL_TRANSFER_REPO = `<a href="/user/%s">%s</a> transfered repository <code>%s</code> to <a href="/%s">%s</a>`
-	TPL_PUSH_TAG      = `<a href="/user/%s">%s</a> pushed tag <a href="/%s/src/%s" rel="nofollow">%s</a> at <a href="/%s">%s</a>`
-	TPL_COMMENT_ISSUE = `<a href="/user/%s">%s</a> commented on issue <a href="/%s/issues/%s">%s#%s</a>
-<div><img src="%s?s=16" alt="user-avatar"/> %s</div>`
-)
 
 type PushCommit struct {
 	Sha1        string
@@ -151,53 +215,17 @@ type PushCommit struct {
 }
 
 type PushCommits struct {
-	Len     int
-	Commits []*PushCommit
+	Len        int
+	Commits    []*PushCommit
+	CompareUrl string
 }
 
-// ActionDesc accepts int that represents action operation type
-// and returns the description.
-func ActionDesc(act Actioner) string {
-	actUserName := act.GetActUserName()
-	email := act.GetActEmail()
-	repoUserName := act.GetRepoUserName()
-	repoName := act.GetRepoName()
-	repoLink := repoUserName + "/" + repoName
-	branch := act.GetBranch()
-	content := act.GetContent()
-	switch act.GetOpType() {
-	case 1: // Create repository.
-		return fmt.Sprintf(TPL_CREATE_REPO, actUserName, actUserName, repoLink, repoName)
-	case 5: // Commit repository.
-		var push *PushCommits
-		if err := json.Unmarshal([]byte(content), &push); err != nil {
-			return err.Error()
-		}
-		buf := bytes.NewBuffer([]byte("\n"))
-		for _, commit := range push.Commits {
-			buf.WriteString(fmt.Sprintf(TPL_COMMIT_REPO_LI, AvatarLink(commit.AuthorEmail), repoLink, commit.Sha1, commit.Sha1[:7], commit.Message) + "\n")
-		}
-		if push.Len > 3 {
-			buf.WriteString(fmt.Sprintf(`<div><a href="/%s/%s/commits/%s" rel="nofollow">%d other commits >></a></div>`, actUserName, repoName, branch, push.Len))
-		}
-		return fmt.Sprintf(TPL_COMMIT_REPO, actUserName, actUserName, repoLink, branch, branch, repoLink, repoLink,
-			buf.String())
-	case 6: // Create issue.
-		infos := strings.SplitN(content, "|", 2)
-		return fmt.Sprintf(TPL_CREATE_ISSUE, actUserName, actUserName, repoLink, infos[0], repoLink, infos[0],
-			AvatarLink(email), infos[1])
-	case 8: // Transfer repository.
-		newRepoLink := content + "/" + repoName
-		return fmt.Sprintf(TPL_TRANSFER_REPO, actUserName, actUserName, repoLink, newRepoLink, newRepoLink)
-	case 9: // Push tag.
-		return fmt.Sprintf(TPL_PUSH_TAG, actUserName, actUserName, repoLink, branch, branch, repoLink, repoLink)
-	case 10: // Comment issue.
-		infos := strings.SplitN(content, "|", 2)
-		return fmt.Sprintf(TPL_COMMENT_ISSUE, actUserName, actUserName, repoLink, infos[0], repoLink, infos[0],
-			AvatarLink(email), infos[1])
-	default:
-		return "invalid type"
+func ActionContent2Commits(act Actioner) *PushCommits {
+	var push *PushCommits
+	if err := json.Unmarshal([]byte(act.GetContent()), &push); err != nil {
+		return nil
 	}
+	return push
 }
 
 func DiffTypeToStr(diffType int) string {
@@ -228,7 +256,7 @@ func Oauth2Icon(t int) string {
 	case 3:
 		return "fa-twitter-square"
 	case 4:
-		return "fa-linux"
+		return "fa-qq"
 	case 5:
 		return "fa-weibo"
 	}
@@ -240,11 +268,11 @@ func Oauth2Name(t int) string {
 	case 1:
 		return "GitHub"
 	case 2:
-		return "Google"
+		return "Google+"
 	case 3:
 		return "Twitter"
 	case 4:
-		return "Tencent QQ"
+		return "腾讯 QQ"
 	case 5:
 		return "Weibo"
 	}

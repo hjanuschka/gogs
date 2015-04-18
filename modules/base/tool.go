@@ -9,22 +9,51 @@ import (
 	"crypto/md5"
 	"crypto/rand"
 	"crypto/sha1"
+	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"hash"
+	"html/template"
 	"math"
-	"strconv"
 	"strings"
 	"time"
 
+	"github.com/Unknwon/com"
+	"github.com/Unknwon/i18n"
+	"github.com/microcosm-cc/bluemonday"
+
+	"github.com/gogits/gogs/modules/avatar"
 	"github.com/gogits/gogs/modules/setting"
 )
 
-// Encode string to md5 hex value
+var Sanitizer = bluemonday.UGCPolicy()
+
+// Encode string to md5 hex value.
 func EncodeMd5(str string) string {
 	m := md5.New()
 	m.Write([]byte(str))
 	return hex.EncodeToString(m.Sum(nil))
+}
+
+// Encode string to sha1 hex value.
+func EncodeSha1(str string) string {
+	h := sha1.New()
+	h.Write([]byte(str))
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func BasicAuthDecode(encoded string) (string, string, error) {
+	s, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return "", "", err
+	}
+
+	auth := strings.SplitN(string(s), ":", 2)
+	return auth[0], auth[1], nil
+}
+
+func BasicAuthEncode(username, password string) string {
+	return base64.StdEncoding.EncodeToString([]byte(username + ":" + password))
 }
 
 // GetRandomString generate random string by specify chars.
@@ -89,7 +118,7 @@ func VerifyTimeLimitCode(data string, minutes int, code string) bool {
 	// split code
 	start := code[:12]
 	lives := code[12:18]
-	if d, err := StrTo(lives).Int(); err == nil {
+	if d, err := com.StrTo(lives).Int(); err == nil {
 		minutes = d
 	}
 
@@ -97,7 +126,7 @@ func VerifyTimeLimitCode(data string, minutes int, code string) bool {
 	retCode := CreateTimeLimitCode(data, minutes, start)
 	if retCode == code && minutes > 0 {
 		// check time is expired or not
-		before, _ := DateParse(start, "YmdHi")
+		before, _ := time.ParseInLocation("200601021504", start, time.Local)
 		now := time.Now()
 		if before.Add(time.Minute*time.Duration(minutes)).Unix() > now.Unix() {
 			return true
@@ -112,7 +141,7 @@ const TimeLimitCodeLength = 12 + 6 + 40
 // create a time limit code
 // code format: 12 length date time string + 6 minutes string + 40 sha1 encoded string
 func CreateTimeLimitCode(data string, minutes int, startInf interface{}) string {
-	format := "YmdHi"
+	format := "200601021504"
 
 	var start, end time.Time
 	var startStr, endStr string
@@ -120,20 +149,20 @@ func CreateTimeLimitCode(data string, minutes int, startInf interface{}) string 
 	if startInf == nil {
 		// Use now time create code
 		start = time.Now()
-		startStr = DateFormat(start, format)
+		startStr = start.Format(format)
 	} else {
 		// use start string create code
 		startStr = startInf.(string)
-		start, _ = DateParse(startStr, format)
-		startStr = DateFormat(start, format)
+		start, _ = time.ParseInLocation(format, startStr, time.Local)
+		startStr = start.Format(format)
 	}
 
 	end = start.Add(time.Minute * time.Duration(minutes))
-	endStr = DateFormat(end, format)
+	endStr = end.Format(format)
 
 	// create sha1 encode string
 	sh := sha1.New()
-	sh.Write([]byte(data + setting.SecretKey + startStr + endStr + ToStr(minutes)))
+	sh.Write([]byte(data + setting.SecretKey + startStr + endStr + com.ToStr(minutes)))
 	encoded := hex.EncodeToString(sh.Sum(nil))
 
 	code := fmt.Sprintf("%s%06d%s", startStr, minutes, encoded)
@@ -142,12 +171,15 @@ func CreateTimeLimitCode(data string, minutes int, startInf interface{}) string 
 
 // AvatarLink returns avatar link by given e-mail.
 func AvatarLink(email string) string {
-	if setting.DisableGravatar {
-		return "/img/avatar_default.jpg"
-	} else if setting.Service.EnableCacheAvatar {
-		return "/avatar/" + EncodeMd5(email)
+	if setting.DisableGravatar || setting.OfflineMode {
+		return setting.AppSubUrl + "/img/avatar_default.jpg"
 	}
-	return "//1.gravatar.com/avatar/" + EncodeMd5(email)
+
+	gravatarHash := avatar.HashEmail(email)
+	if setting.Service.EnableCacheAvatar {
+		return setting.AppSubUrl + "/avatar/" + gravatarHash
+	}
+	return setting.GravatarSource + gravatarHash
 }
 
 // Seconds-based time units
@@ -239,55 +271,59 @@ func TimeSincePro(then time.Time) string {
 	return strings.TrimPrefix(timeStr, ", ")
 }
 
-// TimeSince calculates the time interval and generate user-friendly string.
-func TimeSince(then time.Time) string {
+func timeSince(then time.Time, lang string) string {
 	now := time.Now()
 
-	lbl := "ago"
+	lbl := i18n.Tr(lang, "tool.ago")
 	diff := now.Unix() - then.Unix()
 	if then.After(now) {
-		lbl = "from now"
+		lbl = i18n.Tr(lang, "tool.from_now")
 		diff = then.Unix() - now.Unix()
 	}
 
 	switch {
 	case diff <= 0:
-		return "now"
+		return i18n.Tr(lang, "tool.now")
 	case diff <= 2:
-		return fmt.Sprintf("1 second %s", lbl)
+		return i18n.Tr(lang, "tool.1s", lbl)
 	case diff < 1*Minute:
-		return fmt.Sprintf("%d seconds %s", diff, lbl)
+		return i18n.Tr(lang, "tool.seconds", diff, lbl)
 
 	case diff < 2*Minute:
-		return fmt.Sprintf("1 minute %s", lbl)
+		return i18n.Tr(lang, "tool.1m", lbl)
 	case diff < 1*Hour:
-		return fmt.Sprintf("%d minutes %s", diff/Minute, lbl)
+		return i18n.Tr(lang, "tool.minutes", diff/Minute, lbl)
 
 	case diff < 2*Hour:
-		return fmt.Sprintf("1 hour %s", lbl)
+		return i18n.Tr(lang, "tool.1h", lbl)
 	case diff < 1*Day:
-		return fmt.Sprintf("%d hours %s", diff/Hour, lbl)
+		return i18n.Tr(lang, "tool.hours", diff/Hour, lbl)
 
 	case diff < 2*Day:
-		return fmt.Sprintf("1 day %s", lbl)
+		return i18n.Tr(lang, "tool.1d", lbl)
 	case diff < 1*Week:
-		return fmt.Sprintf("%d days %s", diff/Day, lbl)
+		return i18n.Tr(lang, "tool.days", diff/Day, lbl)
 
 	case diff < 2*Week:
-		return fmt.Sprintf("1 week %s", lbl)
+		return i18n.Tr(lang, "tool.1w", lbl)
 	case diff < 1*Month:
-		return fmt.Sprintf("%d weeks %s", diff/Week, lbl)
+		return i18n.Tr(lang, "tool.weeks", diff/Week, lbl)
 
 	case diff < 2*Month:
-		return fmt.Sprintf("1 month %s", lbl)
+		return i18n.Tr(lang, "tool.1mon", lbl)
 	case diff < 1*Year:
-		return fmt.Sprintf("%d months %s", diff/Month, lbl)
+		return i18n.Tr(lang, "tool.months", diff/Month, lbl)
 
 	case diff < 2*Year:
-		return fmt.Sprintf("1 year %s", lbl)
+		return i18n.Tr(lang, "tool.1y", lbl)
 	default:
-		return fmt.Sprintf("%d years %s", diff/Year, lbl)
+		return i18n.Tr(lang, "tool.years", diff/Year, lbl)
 	}
+}
+
+// TimeSince calculates the time interval and generate user-friendly string.
+func TimeSince(t time.Time, lang string) template.HTML {
+	return template.HTML(fmt.Sprintf(`<span class="time-since" title="%s">%s</span>`, t.Format(setting.TimeFormat), timeSince(t, lang)))
 }
 
 const (
@@ -383,134 +419,4 @@ func Subtract(left interface{}, right interface{}) interface{} {
 	} else {
 		return fleft + float64(rleft) - (fright + float64(rright))
 	}
-}
-
-// DateFormat pattern rules.
-var datePatterns = []string{
-	// year
-	"Y", "2006", // A full numeric representation of a year, 4 digits   Examples: 1999 or 2003
-	"y", "06", //A two digit representation of a year   Examples: 99 or 03
-
-	// month
-	"m", "01", // Numeric representation of a month, with leading zeros 01 through 12
-	"n", "1", // Numeric representation of a month, without leading zeros   1 through 12
-	"M", "Jan", // A short textual representation of a month, three letters Jan through Dec
-	"F", "January", // A full textual representation of a month, such as January or March   January through December
-
-	// day
-	"d", "02", // Day of the month, 2 digits with leading zeros 01 to 31
-	"j", "2", // Day of the month without leading zeros 1 to 31
-
-	// week
-	"D", "Mon", // A textual representation of a day, three letters Mon through Sun
-	"l", "Monday", // A full textual representation of the day of the week  Sunday through Saturday
-
-	// time
-	"g", "3", // 12-hour format of an hour without leading zeros    1 through 12
-	"G", "15", // 24-hour format of an hour without leading zeros   0 through 23
-	"h", "03", // 12-hour format of an hour with leading zeros  01 through 12
-	"H", "15", // 24-hour format of an hour with leading zeros  00 through 23
-
-	"a", "pm", // Lowercase Ante meridiem and Post meridiem am or pm
-	"A", "PM", // Uppercase Ante meridiem and Post meridiem AM or PM
-
-	"i", "04", // Minutes with leading zeros    00 to 59
-	"s", "05", // Seconds, with leading zeros   00 through 59
-
-	// time zone
-	"T", "MST",
-	"P", "-07:00",
-	"O", "-0700",
-
-	// RFC 2822
-	"r", time.RFC1123Z,
-}
-
-// Parse Date use PHP time format.
-func DateParse(dateString, format string) (time.Time, error) {
-	replacer := strings.NewReplacer(datePatterns...)
-	format = replacer.Replace(format)
-	return time.ParseInLocation(format, dateString, time.Local)
-}
-
-// Date takes a PHP like date func to Go's time format.
-func DateFormat(t time.Time, format string) string {
-	replacer := strings.NewReplacer(datePatterns...)
-	format = replacer.Replace(format)
-	return t.Format(format)
-}
-
-// convert string to specify type
-
-type StrTo string
-
-func (f StrTo) Exist() bool {
-	return string(f) != string(0x1E)
-}
-
-func (f StrTo) Int() (int, error) {
-	v, err := strconv.ParseInt(f.String(), 10, 32)
-	return int(v), err
-}
-
-func (f StrTo) Int64() (int64, error) {
-	v, err := strconv.ParseInt(f.String(), 10, 64)
-	return int64(v), err
-}
-
-func (f StrTo) String() string {
-	if f.Exist() {
-		return string(f)
-	}
-	return ""
-}
-
-// convert any type to string
-func ToStr(value interface{}, args ...int) (s string) {
-	switch v := value.(type) {
-	case bool:
-		s = strconv.FormatBool(v)
-	case float32:
-		s = strconv.FormatFloat(float64(v), 'f', argInt(args).Get(0, -1), argInt(args).Get(1, 32))
-	case float64:
-		s = strconv.FormatFloat(v, 'f', argInt(args).Get(0, -1), argInt(args).Get(1, 64))
-	case int:
-		s = strconv.FormatInt(int64(v), argInt(args).Get(0, 10))
-	case int8:
-		s = strconv.FormatInt(int64(v), argInt(args).Get(0, 10))
-	case int16:
-		s = strconv.FormatInt(int64(v), argInt(args).Get(0, 10))
-	case int32:
-		s = strconv.FormatInt(int64(v), argInt(args).Get(0, 10))
-	case int64:
-		s = strconv.FormatInt(v, argInt(args).Get(0, 10))
-	case uint:
-		s = strconv.FormatUint(uint64(v), argInt(args).Get(0, 10))
-	case uint8:
-		s = strconv.FormatUint(uint64(v), argInt(args).Get(0, 10))
-	case uint16:
-		s = strconv.FormatUint(uint64(v), argInt(args).Get(0, 10))
-	case uint32:
-		s = strconv.FormatUint(uint64(v), argInt(args).Get(0, 10))
-	case uint64:
-		s = strconv.FormatUint(v, argInt(args).Get(0, 10))
-	case string:
-		s = v
-	case []byte:
-		s = string(v)
-	default:
-		s = fmt.Sprintf("%v", v)
-	}
-	return s
-}
-
-type argInt []int
-
-func (a argInt) Get(i int, args ...int) (r int) {
-	if i >= 0 && i < len(a) {
-		r = a[i]
-	} else if len(args) > 0 {
-		r = args[0]
-	}
-	return
 }

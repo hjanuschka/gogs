@@ -4,14 +4,14 @@
 
 package base
 
+const DOC_URL = "http://gogs.io/docs"
+
 type (
-	// Type TmplData represents data in the templates.
-	TmplData map[string]interface{}
-	TplName  string
+	TplName string
 
 	ApiJsonErr struct {
 		Message string `json:"message"`
-		DocUrl  string `json:"documentation_url"`
+		DocUrl  string `json:"url"`
 	}
 )
 

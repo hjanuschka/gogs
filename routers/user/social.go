@@ -8,10 +8,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/url"
-	"strings"
+	// "strings"
+	"time"
 
-	"github.com/go-martini/martini"
+	"github.com/macaron-contrib/oauth2"
 
 	"github.com/gogits/gogs/models"
 	"github.com/gogits/gogs/modules/log"
@@ -20,48 +20,39 @@ import (
 	"github.com/gogits/gogs/modules/social"
 )
 
-func extractPath(next string) string {
-	n, err := url.Parse(next)
-	if err != nil {
-		return "/"
-	}
-	return n.Path
-}
-
-func SocialSignIn(ctx *middleware.Context, params martini.Params) {
+func SocialSignIn(ctx *middleware.Context) {
 	if setting.OauthService == nil {
-		ctx.Handle(404, "social.SocialSignIn(oauth service not enabled)", nil)
+		ctx.Handle(404, "OAuth2 service not enabled", nil)
 		return
 	}
 
-	next := extractPath(ctx.Query("next"))
-	name := params["name"]
+	next := setting.AppSubUrl + "/user/login"
+	info := ctx.Session.Get(oauth2.KEY_TOKEN)
+	if info == nil {
+		ctx.Redirect(next)
+		return
+	}
+
+	name := ctx.Params(":name")
 	connect, ok := social.SocialMap[name]
 	if !ok {
-		ctx.Handle(404, "social.SocialSignIn(social login not enabled)", errors.New(name))
+		ctx.Handle(404, "social login not enabled", errors.New(name))
 		return
 	}
 
-	code := ctx.Query("code")
-	if code == "" {
-		// redirect to social login page
-		connect.SetRedirectUrl(strings.TrimSuffix(setting.AppUrl, "/") + ctx.Req.URL.Path)
-		ctx.Redirect(connect.AuthCodeURL(next))
+	tk := new(oauth2.Token)
+	if err := json.Unmarshal(info.([]byte), tk); err != nil {
+		ctx.Handle(500, "Unmarshal token", err)
 		return
 	}
-
-	// handle call back
-	tk, err := connect.Exchange(code)
-	if err != nil {
-		ctx.Handle(500, "social.SocialSignIn(Exchange)", err)
-		return
-	}
-	next = extractPath(ctx.Query("state"))
-	log.Trace("social.SocialSignIn(Got token)")
 
 	ui, err := connect.UserInfo(tk, ctx.Req.URL)
 	if err != nil {
-		ctx.Handle(500, fmt.Sprintf("social.SocialSignIn(get info from %s)", name), err)
+		ctx.Handle(500, fmt.Sprintf("UserInfo(%s)", name), err)
+		return
+	}
+	if len(ui.Identity) == 0 {
+		ctx.Handle(404, "no identity is presented", errors.New(name))
 		return
 	}
 	log.Info("social.SocialSignIn(social login): %s", ui)
@@ -69,8 +60,8 @@ func SocialSignIn(ctx *middleware.Context, params martini.Params) {
 	oa, err := models.GetOauth2(ui.Identity)
 	switch err {
 	case nil:
-		ctx.Session.Set("userId", oa.User.Id)
-		ctx.Session.Set("userName", oa.User.Name)
+		ctx.Session.Set("uid", oa.User.Id)
+		ctx.Session.Set("uname", oa.User.Name)
 	case models.ErrOauth2RecordNotExist:
 		raw, _ := json.Marshal(tk)
 		oa = &models.Oauth2{
@@ -81,14 +72,19 @@ func SocialSignIn(ctx *middleware.Context, params martini.Params) {
 		}
 		log.Trace("social.SocialSignIn(oa): %v", oa)
 		if err = models.AddOauth2(oa); err != nil {
-			log.Error("social.SocialSignIn(add oauth2): %v", err) // 501
+			log.Error(4, "social.SocialSignIn(add oauth2): %v", err) // 501
 			return
 		}
 	case models.ErrOauth2NotAssociated:
-		next = "/user/sign_up"
+		next = setting.AppSubUrl + "/user/sign_up"
 	default:
 		ctx.Handle(500, "social.SocialSignIn(GetOauth2)", err)
 		return
+	}
+
+	oa.Updated = time.Now()
+	if err = models.UpdateOauth2(oa); err != nil {
+		log.Error(4, "UpdateOauth2: %v", err)
 	}
 
 	ctx.Session.Set("socialId", oa.Id)

@@ -5,13 +5,8 @@
 package auth
 
 import (
-	"net/http"
-	"reflect"
-
-	"github.com/go-martini/martini"
-
-	"github.com/gogits/gogs/modules/base"
-	"github.com/gogits/gogs/modules/middleware/binding"
+	"github.com/Unknwon/macaron"
+	"github.com/macaron-contrib/binding"
 )
 
 // ________                            .__                __  .__
@@ -22,45 +17,26 @@ import (
 //         \/     /_____/     \/     \/         \/     \/                    \/
 
 type CreateOrgForm struct {
-	OrgName string `form:"orgname" binding:"Required;AlphaDashDot;MaxSize(30)"`
+	OrgName string `form:"org_name" binding:"Required;AlphaDashDot;MaxSize(30)"`
 	Email   string `form:"email" binding:"Required;Email;MaxSize(50)"`
 }
 
-func (f *CreateOrgForm) Name(field string) string {
-	names := map[string]string{
-		"OrgName": "Organization name",
-		"Email":   "E-mail address",
-	}
-	return names[field]
+func (f *CreateOrgForm) Validate(ctx *macaron.Context, errs binding.Errors) binding.Errors {
+	return validate(errs, ctx.Data, f, ctx.Locale)
 }
 
-func (f *CreateOrgForm) Validate(errs *binding.Errors, req *http.Request, ctx martini.Context) {
-	data := ctx.Get(reflect.TypeOf(base.TmplData{})).Interface().(base.TmplData)
-	validate(errs, data, f)
-}
-
-type OrgSettingForm struct {
-	DisplayName string `form:"display_name" binding:"Required;MaxSize(100)"`
+type UpdateOrgSettingForm struct {
+	OrgUserName string `form:"uname" binding:"Required;MaxSize(35)"`
+	OrgFullName string `form:"fullname" binding:"MaxSize(100)"`
 	Email       string `form:"email" binding:"Required;Email;MaxSize(50)"`
 	Description string `form:"desc" binding:"MaxSize(255)"`
-	Website     string `form:"site" binding:"Url;MaxSize(100)"`
+	Website     string `form:"website" binding:"Url;MaxSize(100)"`
 	Location    string `form:"location" binding:"MaxSize(50)"`
+	Avatar      string `form:"avatar" binding:"Required;Email;MaxSize(50)"`
 }
 
-func (f *OrgSettingForm) Name(field string) string {
-	names := map[string]string{
-		"DisplayName": "Display name",
-		"Email":       "E-mail address",
-		"Description": "Description",
-		"Website":     "Website address",
-		"Location":    "Location",
-	}
-	return names[field]
-}
-
-func (f *OrgSettingForm) Validate(errors *binding.Errors, req *http.Request, context martini.Context) {
-	data := context.Get(reflect.TypeOf(base.TmplData{})).Interface().(base.TmplData)
-	validate(errors, data, f)
+func (f *UpdateOrgSettingForm) Validate(ctx *macaron.Context, errs binding.Errors) binding.Errors {
+	return validate(errs, ctx.Data, f, ctx.Locale)
 }
 
 // ___________
@@ -71,20 +47,11 @@ func (f *OrgSettingForm) Validate(errors *binding.Errors, req *http.Request, con
 //              \/     \/      \/
 
 type CreateTeamForm struct {
-	TeamName    string `form:"name" binding:"Required;AlphaDashDot;MaxSize(30)"`
+	TeamName    string `form:"team_name" binding:"Required;AlphaDashDot;MaxSize(30)"`
 	Description string `form:"desc" binding:"MaxSize(255)"`
 	Permission  string `form:"permission"`
 }
 
-func (f *CreateTeamForm) Name(field string) string {
-	names := map[string]string{
-		"TeamName":    "Team name",
-		"Description": "Team description",
-	}
-	return names[field]
-}
-
-func (f *CreateTeamForm) Validate(errs *binding.Errors, req *http.Request, ctx martini.Context) {
-	data := ctx.Get(reflect.TypeOf(base.TmplData{})).Interface().(base.TmplData)
-	validate(errs, data, f)
+func (f *CreateTeamForm) Validate(ctx *macaron.Context, errs binding.Errors) binding.Errors {
+	return validate(errs, ctx.Data, f, ctx.Locale)
 }
